@@ -363,8 +363,8 @@ function LocalCardBody({ a, context }: { a: Artifact; context: LibCtx }) {
               {a.publication && (
                 <Share2
                   size={12}
-                  className={a.publication.last_error ? 'text-danger shrink-0' : 'text-ok shrink-0'}
-                  aria-label={a.publication.last_error ? i18nT('pages.artifactsPage.published_sync_issue') : i18nT('pages.artifactsPage.published', { visibility: a.publication.visibility.toLowerCase() })}
+                  className={a.publication.last_error ? 'text-danger shrink-0' : a.publication.notice ? 'text-warn shrink-0' : 'text-ok shrink-0'}
+                  aria-label={a.publication.last_error ? i18nT('pages.artifactsPage.published_sync_issue') : a.publication.notice ? i18nT('pages.artifactsPage.published_rolling_out') : i18nT('pages.artifactsPage.published', { visibility: a.publication.visibility.toLowerCase() })}
                 />
               )}
             </div>

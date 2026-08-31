@@ -243,6 +243,16 @@ class PublishResult:
     version_number: int  # destination version number (usually 1)
     concurrency_token: str  # opaque token to pass to the next push (sha256)
     owner: str = ""  # destination-side owner alias ("shared by")
+    # Non-empty when the publish SUCCEEDED but the link is not usable yet -- the content
+    # is stored at the destination and this result's handle is valid, so the publication
+    # must be recorded, but something the user needs to know stands between them and a
+    # working link (e.g. a CDN rollout that has not finished). Raising instead would be
+    # lossy: the caller stores the publication only on success, so an abort after the
+    # content is already uploaded strands it with no withdrawal handle. Recorded as the
+    # publication's ``notice`` -- NOT ``last_error``, because ``last_error`` is read as
+    # failure by every consumer, so a success reported there renders the publish red and
+    # withholds the URL.
+    notice: str = ""
 
 
 @dataclass

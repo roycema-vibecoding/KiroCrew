@@ -259,6 +259,11 @@ class ArtifactPublication:
     published_at: str = ""
     published_by: str = ""  # gateway owner alias (ownerAlias from the remote store)
     last_error: str = ""  # conflict / sync-failure surfaced to the UI
+    #: A non-error status line for a publish that SUCCEEDED but whose link is
+    #: not usable yet (e.g. CloudFront still rolling out the first deploy). This
+    #: is NOT an error — it must never be written to ``last_error``, which every
+    #: consumer reads as failure (renders the publish red and withholds the URL).
+    notice: str = ""
     #: sha256 of the LIVE (CRDT) remote body as of the last sync (publish / push
     #: / pull / clone / overwrite). A live CRDT provider canonicalizes markdown on write, so
     #: drift is detected remote-vs-remote against this hash — snapshot_seq bumps
@@ -3342,6 +3347,7 @@ class ArtifactStore:
             published_at=str(raw_pub.get("published_at") or ""),
             published_by=str(raw_pub.get("published_by") or ""),
             last_error=str(raw_pub.get("last_error") or ""),
+            notice=str(raw_pub.get("notice") or ""),
             last_synced_remote_hash=str(raw_pub.get("last_synced_remote_hash") or ""),
         )
 

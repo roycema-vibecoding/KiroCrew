@@ -3651,6 +3651,31 @@ export const api = {
 
   artifactTeardown: (slug: string) => post(`/api/deploy/teardown/${slug}`, { confirm: true }).then(j),
   publishProviders: () => get('/api/publish-providers').then(j) as Promise<{ providers: AppPublishProvider[] }>,
+  /** Publish through a CORE-registry destination, resolved by its registry name.
+   *  Separate from `publishToProvider` on purpose: that one routes at an app's declared
+   *  endpoint and falls back to `/api/deploy/deploy`, which is per-artifact deploy
+   *  infrastructure -- a different destination, not a different spelling of this one. */
+  publishArtifactToCoreProvider: async (slug: string, providerName: string) => {
+    const r = await post(`/api/artifacts/${encodeURIComponent(slug)}/publish`, {
+      visibility: 'PUBLIC',
+      shared_with: [],
+      provider: providerName,
+    })
+    checkSessionExpired(r)
+    if (r.ok) { removeAuthBanner(); return r.json() }
+    if (r.status === 409) { return r.json() }
+    // Parse before surfacing. The body is JSON, so returning its raw text put
+    // `{"error": "No AWS account is registered yet..."}` verbatim in the error line --
+    // the provider's carefully worded remedy delivered wrapped in syntax.
+    const text = await r.text()
+    try {
+      const parsed = JSON.parse(text)
+      const msg = typeof parsed?.error === 'string' ? parsed.error : text
+      return { error: msg }
+    } catch {
+      return { error: text }
+    }
+  },
   publishToProvider: async (slug: string, providerId: string, provider?: AppPublishProvider, ttlHours?: number) => {
     // Route to the provider's declared endpoint with the payload shape
     // that _do_deploy expects (site_id + artifact_slug). ttl_hours is sent on

@@ -447,8 +447,16 @@ def create_oac(name: str, profile: str) -> str:
     return json.loads(out)["OriginAccessControl"]["Id"]
 
 
-def distribution_config(bucket: str, region: str, oac_id: str) -> dict[str, Any]:
-    """Build the CloudFront DistributionConfig: S3 REST origin + OAC, HTTPS, index.html."""
+def distribution_config(
+    bucket: str, region: str, oac_id: str, response_headers_policy_id: str = ""
+) -> dict[str, Any]:
+    """Build the CloudFront DistributionConfig: S3 REST origin + OAC, HTTPS, index.html.
+
+    ``response_headers_policy_id`` substitutes the managed SecurityHeadersPolicy below.
+    A caller serving MUTUALLY UNTRUSTED documents from one distribution needs headers the
+    managed policy does not carry, and the policy id is the only place a distribution can
+    express them. Omitting it keeps the historical behaviour exactly.
+    """
     origin_domain = f"{bucket}.s3.{region}.amazonaws.com"
     origin_id = f"s3-{bucket}"
     return {
@@ -475,16 +483,29 @@ def distribution_config(bucket: str, region: str, oac_id: str) -> dict[str, Any]
             # nosniff, X-Frame-Options SAMEORIGIN, and Referrer-Policy on every
             # response — without HSTS a MITM could downgrade the first request
             # (CWE-319). Parity with base-stack.yaml's SecurityHeadersPolicy.
-            "ResponseHeadersPolicyId": "67f7725c-6f97-4210-82d7-5512b31e9d03",
+            "ResponseHeadersPolicyId": response_headers_policy_id
+            or "67f7725c-6f97-4210-82d7-5512b31e9d03",
         },
     }
 
 
-def create_distribution(bucket: str, region: str, oac_id: str, site_id: str, profile: str) -> dict[str, str]:
-    """Create a tagged distribution (tag-on-create, §5). Returns id/arn/domain."""
+def create_distribution(bucket: str, region: str, oac_id: str, site_id: str, profile: str,
+                        tags: list[dict[str, str]] | None = None,
+                        response_headers_policy_id: str = "") -> dict[str, str]:
+    """Create a tagged distribution (tag-on-create, §5). Returns id/arn/domain.
+
+    ``tags`` overrides the tag set written on create. It exists because the tags below
+    are the SITE surface's, and a caller needing a different set had no way to get one:
+    it had to create with these and then tag/untag afterwards, which is two more calls,
+    a window in which the resource is mis-tagged, and a ``cloudfront:UntagResource``
+    permission it would otherwise never need. Omitting it keeps the historical behaviour
+    exactly, so every existing caller is unaffected.
+    """
     payload = {
-        "DistributionConfig": distribution_config(bucket, region, oac_id),
-        "Tags": {"Items": [
+        "DistributionConfig": distribution_config(
+            bucket, region, oac_id, response_headers_policy_id
+        ),
+        "Tags": {"Items": tags if tags is not None else [
             {"Key": TAG_MANAGED, "Value": "true"},
             {"Key": TAG_SITE, "Value": site_id},
         ]},

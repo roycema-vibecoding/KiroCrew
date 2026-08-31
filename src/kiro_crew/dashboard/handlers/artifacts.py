@@ -1969,6 +1969,21 @@ async def api_artifact_delete(request: web.Request) -> web.Response:
         # reaches the delete() call below, which returns a clean 4xx (a bare
         # ArtifactNotFoundError catch here would leak ArtifactValidationError as a 500).
         _existing = None
+    # Withdraw the destination copy BEFORE the local delete, so the publication -- the
+    # only handle that can withdraw it -- still exists while the attempt is made. The
+    # reverse order was tried and reverted twice; this ordering is the one with the
+    # smaller crash residue. Die between the two steps here and the copy is withdrawn but
+    # the artifact remains, which the user simply deletes again. Die between them in the
+    # other order and the record is already gone while the content is still public, with
+    # nothing left to withdraw it by.
+    #
+    # A destination failure is logged, NOT propagated, and the local delete proceeds. The
+    # alternative -- abort the deletion -- makes the user's own delete hostage to a remote
+    # system: with credentials expired or the account closed, the withdrawal can never
+    # succeed and they could never delete their own artifact. `delete_for_artifact` is
+    # guarded end to end for exactly this call site.
+    if _existing is not None and _existing.publication is not None:
+        await publish_sync.delete_for_artifact(_existing)
     try:
         get_default_store().delete(slug)
     except ArtifactNotFoundError as exc:
@@ -4196,6 +4211,10 @@ async def api_artifact_publish_providers(request: web.Request) -> web.Response:
                 # False + present in this list ⇒ installs on first publish; the
                 # FE may surface an "installs on first use" hint.
                 "available": avail,
+                # The remedy text for `available: false`. Without it the picker can only
+                # send the user somewhere generic, and a provider's own hint is the only
+                # thing that knows WHICH action makes it available.
+                "install_hint": str(getattr(p, "install_hint", "") or ""),
                 "sharing_model": _sharing_model_dict(sm),
                 "sync_model": {
                     "authority": sy.authority,

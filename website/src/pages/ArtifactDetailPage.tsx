@@ -1854,6 +1854,18 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
           </div>
         )}
 
+        {/* Notice-only publication: the publish SUCCEEDED and the link is valid,
+            it just is not reachable yet (e.g. CloudFront still rolling out). That
+            is not a failure, so it renders as a neutral/warn line -- never the
+            danger surface `last_error` drives. Suppressed when a real error is
+            present, since that is the more important thing to show. */}
+        {artifact.publication?.notice && !artifact.publication.last_error && (
+          <div className="mb-3 flex items-start gap-2 px-3 py-2 rounded-md border border-warn/30 bg-warn-subtle text-[13px] text-warn">
+            <AlertTriangle className="lucide-inline shrink-0 mt-0.5" />
+            <span>{i18nT('pages.artifactDetailPage.publication_still_rolling_out')}</span>
+          </div>
+        )}
+
         {/* Publish panel — toggled by the Publish toolbar button */}
         {showPublish && artifact.kind !== 'webapp' && artifact.kind !== 'image' && (
           <div className="mb-3">

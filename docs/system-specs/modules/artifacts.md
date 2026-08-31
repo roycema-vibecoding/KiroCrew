@@ -203,12 +203,15 @@ at parity with the dashboard — guarded in `test_remote_artifacts.py`.
 (`pull-latest` / `upstream-status` / `overwrite-remote`) wire `publish_sync`'s
 provider-agnostic orchestration (`pull_upstream` / `clone_from_remote` /
 `fork_from_remote` / `upstream_status` / `overwrite_upstream`) to HTTP. The
-surface is **inert in the public edition**: the provider registry is empty, so
-`get_provider()` raises `PublishUnavailableError` → browse / clone / fork all
-503, and the frontend gates the entire remote section + `UpstreamSyncBanner` on
-a non-empty `GET /api/artifacts/publish-providers` result (zero remote pixels /
-requests with no provider). A companion registers providers via the CPP publish
-seam. The picker includes a provider whenever `available() or installable()`
+surface's reach depends on what the registered destination declares. The public
+edition registers the personal cloud drive, which serves published bytes but
+declares no `CONTENT_PULL` and an all-off `DiscoveryModel`, so browse / clone /
+fork stay unavailable while publish works; the frontend gates the entire remote
+section + `UpstreamSyncBanner` on a non-empty
+`GET /api/artifacts/publish-providers` result (zero remote pixels / requests
+when no provider is registered at all). A companion registers its own provider
+via the CPP publish seam. The picker includes a provider whenever
+`available() or installable()`
 (`PublishProvider.installable()` defaults `False`; a companion provider whose
 `ensure_ready()` self-installs on first publish overrides it to `True`), and
 each row carries an `available` flag so the FE can hint install-on-first-use for
@@ -275,7 +278,44 @@ treats the version push as best-effort: its re-publish branch runs
 and returns normally — so the route answers 200 with a publication whose remote
 content is stale. A non-empty (non-whitespace) `last_error` is therefore an error
 outcome carrying the provider's own already-redacted message; whitespace-only
-stays success, because the core writes `""` to clear the field.
+stays success, because the core writes `""` to clear the field. A publish that
+SUCCEEDED but whose link is not usable yet (e.g. CloudFront still rolling out)
+records that status on the separate `publication.notice` field, never
+`last_error` — so it does not render the publish as failed or withhold the URL.
+
+### Withdrawal is NOT best-effort
+
+`publish_sync.unpublish` deletes at the destination and only then clears the local
+`publication` block. A failure keeps the block and raises, because that block is the
+only handle to content that may still be served: clearing it strands the remote copy
+with nothing recording where it lives and no retry able to reach it. Both mouths fail
+the same way -- a provider that raises, and a destination reporting `available() ==
+False`, which skips the delete entirely and so loses the handle just as silently.
+
+Deleting the artifact is the way out of a kept publication, and it notifies the
+destination. `delete_for_artifact` runs from the delete handler BEFORE the local delete,
+using the publication the handler already read for its version capture. The ordering is
+chosen for its crash residue: die between the two steps in this order and the copy is
+withdrawn while the artifact remains, which the user simply deletes again; die between
+them in the reverse order and the local record is already gone while the content is still
+public, with nothing left to withdraw it by. Since `delete()` removes the artifact
+directory by slug under the store lock rather than writing back a value read earlier,
+placing a network round trip ahead of it does not widen any compare-and-swap window -- a
+save landing in that window is included in the delete the user asked for.
+
+A destination failure is logged, NOT propagated, and the local delete proceeds. Aborting
+instead would make the user's own delete hostage to a remote system: with credentials
+expired or the account closed the withdrawal can never succeed, so they could never delete
+their own artifact. The function never raises, and the whole body is inside its guard:
+provider resolution and the availability probe can both fail on a publication naming a
+destination this edition does not register. A destination failure therefore costs a log
+line naming the slug and provider, and the residue is bounded and visible: a leftover
+object in the owner's own bucket.
+
+This asymmetry with the publish path above is deliberate. A stale publish leaves the
+wrong bytes at a URL the user already knows about; a stale withdrawal leaves content
+served that the user believes they took down, which is the worse failure and the one
+worth surfacing as an error the user can act on.
 
 The public-exposure warning and the blocking `PublicPublishAckModal` are
 unchanged and unconditional — every destination gets both, on the clean path and

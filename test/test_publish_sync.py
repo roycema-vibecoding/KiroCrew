@@ -113,6 +113,7 @@ class DummyPublishProvider(PublishProvider):
             version_number=int(res.get("versionNumber") or 1),
             concurrency_token=str(res.get("sha256") or ""),
             owner=str(res.get("ownerAlias") or ""),
+            notice=str(res.get("notice") or ""),
         )
 
     async def push_version(self, *, external_id, file_path, expected_token) -> PushResult:
@@ -271,6 +272,90 @@ async def test_publish_sets_publication(store, fake_client):
 
 
 @pytest.mark.asyncio
+async def test_publish_records_a_provider_notice_without_losing_the_publication(
+    store, fake_client
+):
+    """A destination that stored the content but cannot serve it YET (a CDN mid-rollout)
+    must not have to choose between telling the user and keeping the handle. Raising
+    would skip `set_publication` entirely, stranding content that is already uploaded
+    with nothing to withdraw it by, so the notice rides back on the result. It is a
+    SUCCESS status, so it is recorded on `publication.notice` -- never `last_error`,
+    which every consumer reads as failure (renders the publish red and withholds the
+    URL)."""
+    fake_client.upload_response = {
+        **fake_client.upload_response,
+        "notice": "still rolling out; the same link will work shortly",
+    }
+    art = store.create(name="Doc", content="hello", kind="text")
+    summary = await publish_sync.publish(art.slug, visibility="PUBLIC")
+
+    pub = store.get(art.slug).publication
+    assert pub is not None, "a notice must never cost the withdrawal handle"
+    assert pub.artifact_id == "uuid-123"
+    # The notice rides the dedicated non-error field, and last_error stays empty
+    # so the publish is NOT rendered as a failure.
+    assert "still rolling out" in pub.notice
+    assert pub.last_error == ""
+    assert summary["artifact_id"] == "uuid-123"
+
+
+@pytest.mark.asyncio
+async def test_publish_notice_appears_on_both_payload_keys(store, fake_client):
+    """The API payload must carry the success notice on `notice` and leave
+    `last_error` empty, so a frontend gating red on `last_error` shows the URL
+    and can surface the rollout line separately."""
+    fake_client.upload_response = {
+        **fake_client.upload_response,
+        "notice": "CloudFront still rolling out",
+    }
+    art = store.create(name="Doc", content="hello", kind="text")
+    summary = await publish_sync.publish(art.slug, visibility="PUBLIC")
+
+    assert summary["notice"] == "CloudFront still rolling out"
+    assert summary["last_error"] == ""
+
+
+@pytest.mark.asyncio
+async def test_later_successful_push_clears_a_stale_notice(store, fake_client):
+    """A later successful push settles the rollout question, so a stale
+    'still rolling out' notice from the first publish must not persist."""
+    fake_client.upload_response = {
+        **fake_client.upload_response,
+        "notice": "still rolling out",
+    }
+    store.create(name="Doc", content="v1", kind="text", slug="d")
+    await publish_sync.publish("d", visibility="PUBLIC")
+    assert store.get("d").publication.notice == "still rolling out"
+
+    # A new KiroCrew version pushed successfully clears the stale notice.
+    store.update("d", content="v2 content", snapshot=True)
+    await publish_sync.push_version(store.get("d"))
+
+    pub = store.get("d").publication
+    assert pub.notice == ""
+    assert pub.last_error == ""
+
+
+@pytest.mark.asyncio
+async def test_later_successful_visibility_change_clears_a_stale_notice(store, fake_client):
+    """A visibility change reconciles the publication and settles the rollout
+    question, so it too clears a stale notice."""
+    fake_client.upload_response = {
+        **fake_client.upload_response,
+        "notice": "still rolling out",
+    }
+    store.create(name="Doc", content="v1", kind="text", slug="d")
+    await publish_sync.publish("d", visibility="PRIVATE")
+    assert store.get("d").publication.notice == "still rolling out"
+
+    await publish_sync.update_sharing("d", visibility="PUBLIC")
+
+    pub = store.get("d").publication
+    assert pub.notice == ""
+    assert pub.last_error == ""
+
+
+@pytest.mark.asyncio
 async def test_publish_shared_with(store, fake_client):
     art = store.create(name="Doc", content="hi", kind="text")
     await publish_sync.publish(art.slug, visibility="SHARED", shared_with=["alice", "bob"])
@@ -419,6 +504,59 @@ async def test_unpublish_clears_publication(store, fake_client):
 
 
 @pytest.mark.asyncio
+async def test_unpublish_keeps_the_publication_when_the_destination_fails(store, fake_client):
+    """The publication block is the only handle to content that may still be served, so
+    a failed removal must keep it rather than strand that content with no retry path."""
+    store.create(name="Doc", content="x", kind="text", slug="d")
+    await publish_sync.publish("d")
+    fake_client.delete_response = {"error": "Throttling: rate exceeded"}
+    with pytest.raises(publish_sync.PublishError):
+        await publish_sync.unpublish("d")
+    assert store.get("d").publication is not None
+
+
+@pytest.mark.asyncio
+async def test_unpublish_keeps_the_publication_when_the_destination_is_unreachable(store, fake_client, monkeypatch):
+    """Same invariant through the other mouth: an unavailable destination skips the
+    delete entirely, so clearing the record there loses the handle just as silently."""
+    store.create(name="Doc", content="x", kind="text", slug="d")
+    await publish_sync.publish("d")
+    monkeypatch.setattr(type(fake_client), "available", lambda self: False)
+    with pytest.raises(publish_sync.PublishUnavailableError):
+        await publish_sync.unpublish("d")
+    assert store.get("d").publication is not None
+
+
+@pytest.mark.asyncio
+async def test_going_public_fills_a_link_the_private_publish_could_not_derive(store, fake_client, monkeypatch):
+    """A destination whose link is derived can only produce one once the object is
+    served, so a private publish stores none. Nothing else revisits the field, so
+    without this the artifact ends up public with no link and no way to get one."""
+    store.create(name="Doc", content="x", kind="text", slug="d")
+    await publish_sync.publish("d")
+    store.update_publication("d", view_url="", visibility="PRIVATE")
+    monkeypatch.setattr(
+        type(fake_client), "view_url_for", lambda self, external_id: f"https://drive/{external_id}"
+    )
+    await publish_sync.update_sharing("d", visibility="PUBLIC")
+    assert store.get("d").publication.view_url == "https://drive/uuid-123"
+
+
+@pytest.mark.asyncio
+async def test_going_public_never_replaces_a_link_the_destination_returned(store, fake_client, monkeypatch):
+    """Additive only: a destination that returned its own url at publish time keeps it,
+    so this can add a link but never corrupt one it did not create."""
+    store.create(name="Doc", content="x", kind="text", slug="d")
+    await publish_sync.publish("d")
+    store.update_publication("d", view_url="https://remote/original", visibility="PRIVATE")
+    monkeypatch.setattr(
+        type(fake_client), "view_url_for", lambda self, external_id: "https://drive/derived"
+    )
+    await publish_sync.update_sharing("d", visibility="PUBLIC")
+    assert store.get("d").publication.view_url == "https://remote/original"
+
+
+@pytest.mark.asyncio
 async def test_unpublish_unpublished_raises(store):
     store.create(name="Doc", content="x", kind="text", slug="d")
     with pytest.raises(publish_sync.NotPublishedError):
@@ -454,6 +592,33 @@ async def test_delete_for_artifact_best_effort(store, fake_client):
     assert fake_client.called("delete")[0]["artifact_id"] == "uuid-123"
     # store untouched (the caller deletes locally afterwards)
     assert store.get("d").publication is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_for_artifact_never_raises_on_an_unknown_provider(store):
+    """Now that the artifact delete handler calls this AFTER committing the local delete,
+    nothing in here may raise -- the user's delete already succeeded and a 500 would report
+    failure for work that was done. Provider resolution is the case the guard used to miss:
+    a publication naming a destination this edition does not register raised before the
+    try block was ever entered."""
+    store.create(name="Doc", content="x", kind="text", slug="gone")
+    art = store.get("gone")
+    art.publication = ArtifactPublication(
+        provider="a-destination-this-edition-does-not-have",
+        artifact_id="uuid-999",
+        view_url="",
+        visibility="PUBLIC",
+    )
+    await publish_sync.delete_for_artifact(art)  # must simply return
+
+
+@pytest.mark.asyncio
+async def test_delete_for_artifact_never_raises_when_the_destination_fails(store, fake_client):
+    store.create(name="Doc", content="x", kind="text", slug="d2")
+    await publish_sync.publish("d2")
+    art = store.get("d2")
+    fake_client.delete_response = {"error": "the destination refused the delete"}
+    await publish_sync.delete_for_artifact(art)  # must swallow and log
 
 
 # ── persistence ────────────────────────────────────────────────────────────────

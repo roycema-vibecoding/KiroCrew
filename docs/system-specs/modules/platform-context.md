@@ -135,7 +135,9 @@ installs the context. `bootstrap_context`:
 2. If profile != standalone: `discover_companion_context` (fail-closed), then validate `contract_version` and the ADD-only security floor.
 3. `assert_governance_paths_protected`, `assert_policy_signature_satisfied`, and `assert_profiles_within_ceiling` validate the final context before `set_context`; these gates prevent an agent-writable trust root, an absent required signature, or a profile looser than its ceiling from becoming active.
 4. `ctx.providers.register_acp_backends()` once (Default no-op).
-5. `ctx.publish.register_publish_providers()` once (Default no-op → the `publish_provider` registry stays empty and publishing is unavailable).
+5. `ctx.publish.register_publish_providers()` once (Default registers the personal
+   cloud drive under `DEFAULT_PROVIDER`, so publishing is available out of the box;
+   a companion edition registers its own destination instead).
 
 ## Profile resolution
 
