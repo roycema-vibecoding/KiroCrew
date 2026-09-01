@@ -5894,7 +5894,8 @@
         "relay_superseded": "This authorization is no longer active. Click Authorize to start fresh.",
         "relaying": "Completing…",
         "remote_gateway_hint": "On a remote gateway the browser's localhost callback will fail — that is expected. Copy the full address the browser landed on and paste it here to finish authorizing.",
-        "requires_authentication": "requires authentication."
+        "requires_authentication": "requires authentication.",
+        "superseded": "sign-in is no longer active — a newer request replaced it. Use the latest Authorize button to sign in."
       },
       "notificationItem": {
         "delete": "Delete"

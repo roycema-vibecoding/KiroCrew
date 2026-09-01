@@ -8841,7 +8841,8 @@
         "relay_superseded": "Cette autorisation n'est plus active. Cliquez sur « Autoriser » pour recommencer.",
         "relaying": "Finalisation…",
         "remote_gateway_hint": "Sur une passerelle distante, le rappel localhost du navigateur échouera — c'est normal. Copiez l'adresse complète sur laquelle le navigateur a abouti et collez-la ici pour terminer l'autorisation.",
-        "requires_authentication": "nécessite une authentification."
+        "requires_authentication": "nécessite une authentification.",
+        "superseded": "n'a plus de connexion active : une nouvelle demande l'a remplacée. Utilisez le bouton « Autoriser » le plus récent pour vous connecter."
       },
       "notificationItem": {
         "acknowledged": "Accusé de réception",

@@ -33,8 +33,10 @@ from kiro_crew.dashboard.chat_runner import (
     _emit_mcp_oauth_request,
     _is_safe_oauth_url,
     _mark_mcp_oauth_completed,
+    _mcp_server_identity,
+    _supersede_open_mcp_oauth_banners,
 )
-from kiro_crew.dashboard.chat_utils import _redact_meta_for_role
+from kiro_crew.dashboard.chat_utils import _prepare_messages, _redact_meta_for_role
 from kiro_crew.dashboard.state import _ChatSlot
 from kiro_crew.mcp_utils import mcp_server_alias
 from kiro_crew.security import oauth_url_contains_credential
@@ -347,6 +349,37 @@ class TestMarkMcpOAuthCompleted:
         _mark_mcp_oauth_completed(state, slot, "phantom", success=True)
         state.broadcast_ws.assert_not_called()
 
+    def test_completion_resolves_the_row_by_mid_on_a_ts_collision(self):
+        """The completion path shares the supersede path's row-identity problem.
+
+        Two replayed banners can carry the same `ts`; a ts lookup resolves the
+        FIRST match, so a completion for the second one would flip the first and
+        leave the real banner open. Both paths now resolve by `mid`.
+        """
+        slot = _ChatSlot("s1")
+        collided = "2026-09-01T00:00:00.000000+00:00"
+        for n in range(2):
+            slot.append(
+                "mcp_oauth",
+                f"🔐 linear requires authentication. ({n})",
+                "msg msg-info",
+                ts=collided,
+                meta={"server_name": "linear", "oauth_url": f"https://mcp.linear.app/{n}"},
+            )
+        # Retire the FIRST so the only open banner is the second one.
+        first, second = slot.messages
+        first["meta"] = {**first["meta"], "superseded": True}
+
+        state = MagicMock()
+        _mark_mcp_oauth_completed(state, slot, "linear", success=True)
+
+        assert second["meta"].get("completed") is True, (
+            "the completion landed on the wrong row -- ts is not a row identity"
+        )
+        assert first["meta"].get("completed") is None
+        _, payload = state.broadcast_ws.call_args[0]
+        assert payload["mid"] == second["meta"]["mid"]
+
     def test_targets_only_open_banner(self):
         """Two emitted banners (e.g., token expired then re-issued): only the
         most recent un-terminalized one should be patched."""
@@ -362,6 +395,302 @@ class TestMarkMcpOAuthCompleted:
         assert all(m["meta"].get("completed") is True for m in slot.messages)
         # Only one broadcast — for the second banner.
         state.broadcast_ws.assert_called_once()
+
+    def test_superseded_banner_is_not_reopened_by_completion(self):
+        """A superseded banner is terminal: a later success must patch the LIVE
+        banner, never walk back into the retired one.
+
+        Without the `superseded` arm in the matcher's terminal test, the loop
+        walking backwards would still skip it (it stops at the first open
+        banner) — but a completion arriving when the newest banner is itself
+        retired would reopen history instead of no-oping.
+        """
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "linear", "https://mcp.linear.app/one")
+        _emit_mcp_oauth_request(MagicMock(), slot, "linear", "https://mcp.linear.app/two")
+        # Retire the live one too, as a fresh emit for the same server would.
+        _supersede_open_mcp_oauth_banners(
+            MagicMock(), slot, "linear", _mcp_server_identity("linear")
+        )
+        state = MagicMock()
+        _mark_mcp_oauth_completed(state, slot, "linear", success=True)
+        state.broadcast_ws.assert_not_called()
+        assert all(m["meta"].get("superseded") is True for m in slot.messages)
+        assert not any(m["meta"].get("completed") for m in slot.messages)
+
+
+# ── _supersede_open_mcp_oauth_banners (issue #7580) ──
+
+
+class TestSupersededOAuthBanners:
+    """A newer authorize request kills the older flow's loopback listener.
+
+    kiro-cli mints the callback port and the PKCE verifier inside the flow it
+    announces, so a second announcement for the same server leaves the first
+    banner pointing at a port that can no longer redeem anything. Left rendered
+    as a live "Authorize" button, it walks the user through a full provider
+    login and dead-ends on `http://127.0.0.1:<dead-port>/?code=…` — a page that
+    looks like success and consumes nothing (issue #7580).
+    """
+
+    def test_second_request_retires_the_first_banner(self):
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "miro", "https://mcp.miro.com/a?port=55089")
+        state = MagicMock()
+        _emit_mcp_oauth_request(state, slot, "miro", "https://mcp.miro.com/a?port=55090")
+
+        assert len(slot.messages) == 2
+        stale, live = slot.messages
+        # The stale banner is terminal and, crucially, carries NO url — a client
+        # that does not know the flag still cannot render the dead link.
+        assert stale["meta"]["superseded"] is True
+        assert "oauth_url" not in stale["meta"]
+        assert "55089" not in stale["content"]
+        # The newest banner is the only live one.
+        assert live["meta"]["oauth_url"] == "https://mcp.miro.com/a?port=55090"
+        assert "superseded" not in live["meta"]
+
+    def test_a_different_server_does_not_retire_this_ones_live_banner(self):
+        """Two servers whose names both redact to one sentinel are still two servers.
+
+        `server_name` is stored REDACTED, and `_redact_acp_string` maps every
+        credential-shaped name onto the same `[REDACTED: credential]` string. So
+        matching banners on it makes two unrelated servers indistinguishable, and
+        the newer one's request would retire the older one's banner — popping an
+        `oauth_url` that is still live and still redeemable. That is strictly
+        worse than the bug this function exists to fix: the rejected-URL branches
+        deliberately retire nothing precisely so a user is never left without the
+        affordance, and this would take a WORKING link away.
+        """
+        name_a = "ghp_" + "A" * 36
+        name_b = "ghp_" + "B" * 36
+        # Precondition: the redaction really does collapse both onto one value,
+        # otherwise this test would pass for the wrong reason.
+        assert chat_runner._redact_acp_string(name_a) == chat_runner._redact_acp_string(name_b)
+
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, name_a, "https://mcp.a.example/authorize")
+        state = MagicMock()
+        _emit_mcp_oauth_request(state, slot, name_b, "https://mcp.b.example/authorize")
+
+        assert len(slot.messages) == 2
+        first, second = slot.messages
+        # Server A's flow is untouched by server B's request: still live, still
+        # holding the URL the user needs.
+        assert "superseded" not in first["meta"]
+        assert first["meta"]["oauth_url"] == "https://mcp.a.example/authorize"
+        assert second["meta"]["oauth_url"] == "https://mcp.b.example/authorize"
+        # And nothing was broadcast as retired, since nothing was retired.
+        for call in state.broadcast_ws.call_args_list:
+            assert call[0][0] != "chat_message_update"
+
+    def test_a_server_name_with_a_lone_surrogate_does_not_crash_the_banner(self):
+        """An ACP server name is untrusted text, and JSON can carry a lone surrogate.
+
+        `json.loads` accepts `"\\ud800"`, so `serverName` can reach us holding a
+        character that has no UTF-8 encoding. The redaction path tolerates it
+        because it never encodes, but hashing the raw name does -- a plain
+        `.encode("utf-8")` raises `UnicodeEncodeError` and takes the whole OAuth
+        event handler down, so the user gets no banner at all for a server whose
+        only sin is a bad name.
+
+        Hashing `repr(name)` fixes that with no codec error handler at all, and
+        the digest is an IDENTITY so it must stay injective -- which rules out
+        `errors="backslashreplace"`, as pinned below.
+        """
+        name = json.loads('"bad\\ud800name"')
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, name, "https://mcp.a.example/authorize")
+
+        assert len(slot.messages) == 1
+        assert slot.messages[0]["meta"]["oauth_url"] == "https://mcp.a.example/authorize"
+        # The identity is still usable and still discriminating.
+        other = json.loads('"bad\\ud801name"')
+        assert _mcp_server_identity(name) != _mcp_server_identity(other)
+        # And it must stay injective against the surrogate's own literal escape
+        # TEXT. `errors="backslashreplace"` renders the surrogate AS that text, so
+        # it would hand these two distinct names one digest -- re-creating the
+        # cross-server collision this key exists to prevent.
+        assert _mcp_server_identity(name) != _mcp_server_identity("bad\\ud800name")
+
+    def test_retirement_is_broadcast_to_clients(self):
+        """An open tab must be repainted, or the dead button stays clickable in
+        the UI the user is actually looking at."""
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "miro", "https://mcp.miro.com/a")
+        state = MagicMock()
+        _emit_mcp_oauth_request(state, slot, "miro", "https://mcp.miro.com/b")
+
+        state.broadcast_ws.assert_called_once()
+        msg_type, payload = state.broadcast_ws.call_args[0]
+        assert msg_type == "chat_message_update"
+        assert payload["slot"] == "s1"
+        assert payload["meta"]["superseded"] is True
+
+    def test_broadcast_identifies_the_row_by_mid_not_only_ts(self):
+        """`ts` is not a row identity on the wire either.
+
+        The client patches by the first row matching a `ts`, so two retirements
+        for two rows sharing one would both land on the same row and leave the
+        other rendering a dead Authorize link. `mid` is the server-minted per-row
+        identity the client prefers.
+        """
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "miro", "https://mcp.miro.com/a")
+        stale_mid = slot.messages[0]["meta"]["mid"]
+        assert stale_mid
+
+        state = MagicMock()
+        _emit_mcp_oauth_request(state, slot, "miro", "https://mcp.miro.com/b")
+
+        _, payload = state.broadcast_ws.call_args[0]
+        assert payload["mid"] == stale_mid
+
+    def test_broadcast_blanks_the_url_even_though_persisted_meta_omits_it(self):
+        """The client MERGES an incoming meta over the row's existing one.
+
+        Omitting `oauth_url` would leave the live URL on the client row, so a tab
+        still running pre-upgrade JS -- which does not know `superseded` -- would
+        keep rendering the dead link. An empty string fails that client's own
+        safe-URL check, so the banner withdraws. The PERSISTED meta still omits
+        the key entirely.
+        """
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "miro", "https://mcp.miro.com/a")
+        state = MagicMock()
+        _emit_mcp_oauth_request(state, slot, "miro", "https://mcp.miro.com/b")
+
+        _, payload = state.broadcast_ws.call_args[0]
+        assert payload["meta"]["oauth_url"] == ""
+        # Persisted meta drops the key rather than blanking it.
+        assert "oauth_url" not in slot.messages[0]["meta"]
+
+    def test_every_stale_banner_is_retired_not_just_the_newest(self):
+        """Banners accumulate one per re-announce (each session init re-emits
+        pending requests), so stopping at the first match would leave the older
+        ones live."""
+        slot = _ChatSlot("s1")
+        for n in range(3):
+            _emit_mcp_oauth_request(MagicMock(), slot, "miro", f"https://mcp.miro.com/{n}")
+        _emit_mcp_oauth_request(MagicMock(), slot, "miro", "https://mcp.miro.com/live")
+
+        *stale, live = slot.messages
+        assert len(stale) == 3
+        assert all(m["meta"].get("superseded") is True for m in stale)
+        assert all("oauth_url" not in m["meta"] for m in stale)
+        assert live["meta"]["oauth_url"] == "https://mcp.miro.com/live"
+
+    def test_other_servers_are_untouched(self):
+        """Each server owns its own flow; retiring one must not retire another's
+        live authorize link."""
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "linear", "https://mcp.linear.app/a")
+        _emit_mcp_oauth_request(MagicMock(), slot, "miro", "https://mcp.miro.com/a")
+        _emit_mcp_oauth_request(MagicMock(), slot, "miro", "https://mcp.miro.com/b")
+
+        linear = slot.messages[0]
+        assert "superseded" not in linear["meta"]
+        assert linear["meta"]["oauth_url"] == "https://mcp.linear.app/a"
+
+    def test_already_completed_banner_is_left_alone(self):
+        """A completed banner is history the user should keep seeing as success,
+        not be told was superseded."""
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "miro", "https://mcp.miro.com/a")
+        _mark_mcp_oauth_completed(MagicMock(), slot, "miro", success=True)
+        _emit_mcp_oauth_request(MagicMock(), slot, "miro", "https://mcp.miro.com/b")
+
+        first = slot.messages[0]
+        assert first["meta"]["completed"] is True
+        assert "superseded" not in first["meta"]
+
+    def test_already_failed_banner_is_left_alone(self):
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "miro", "https://mcp.miro.com/a")
+        _mark_mcp_oauth_completed(MagicMock(), slot, "miro", success=False, error="dns")
+        _emit_mcp_oauth_request(MagicMock(), slot, "miro", "https://mcp.miro.com/b")
+
+        first = slot.messages[0]
+        assert first["meta"]["failed"] is True
+        assert first["meta"]["error"] == "dns"
+        assert "superseded" not in first["meta"]
+
+    def test_rejected_url_does_not_retire_a_live_banner(self):
+        """The rejected branches append a banner with no `oauth_url`, so
+        retiring the older one would take away the user's only authorize
+        affordance and hand back nothing usable."""
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "miro", "https://mcp.miro.com/a")
+        _emit_mcp_oauth_request(MagicMock(), slot, "miro", "javascript:alert(1)")
+
+        live, rejected = slot.messages
+        assert live["meta"]["oauth_url"] == "https://mcp.miro.com/a"
+        assert "superseded" not in live["meta"]
+        assert rejected["meta"]["failed"] is True
+
+    def test_no_open_banner_is_a_noop(self):
+        slot = _ChatSlot("s1")
+        state = MagicMock()
+        _supersede_open_mcp_oauth_banners(state, slot, "miro", _mcp_server_identity("miro"))
+        state.broadcast_ws.assert_not_called()
+        assert slot.messages == []
+
+    def test_colliding_timestamps_still_retire_every_banner(self):
+        """`ts` is not a row identity, so retirement must not resolve rows by it.
+
+        `_ChatSlot.append` preserves an explicitly supplied `ts` verbatim -- a row
+        replayed from a channel transcript keeps its own -- and its docstring notes
+        a coarse OS clock stamps two same-tick rows identically, which is why every
+        row also carries a random id. A ts-keyed patch resolves the FIRST match, so
+        on a collision it would rewrite one row twice and leave the second banner
+        open, still offering the dead link this function exists to withdraw.
+
+        Two replayed banners sharing a `ts` is the reachable shape, so they are
+        appended directly here: going through `_emit_mcp_oauth_request` twice would
+        have the second call retire the first, leaving only one row open and never
+        exercising the collision at all.
+        """
+        slot = _ChatSlot("s1")
+        collided = "2026-09-01T00:00:00.000000+00:00"
+        for n in range(2):
+            slot.append(
+                "mcp_oauth",
+                f"🔐 miro requires authentication. ({n})",
+                "msg msg-info",
+                ts=collided,
+                meta={"server_name": "miro", "oauth_url": f"https://mcp.miro.com/{n}"},
+            )
+        assert [m["ts"] for m in slot.messages] == [collided, collided]
+
+        state = MagicMock()
+        _supersede_open_mcp_oauth_banners(state, slot, "miro", _mcp_server_identity("miro"))
+
+        assert all(m["meta"].get("superseded") is True for m in slot.messages), (
+            "a ts collision left a banner open, still offering a dead loopback link"
+        )
+        assert all("oauth_url" not in m["meta"] for m in slot.messages)
+        # Each row patched exactly once -- not the first one twice.
+        assert state.broadcast_ws.call_count == 2
+
+    def test_retirement_marks_the_slot_dirty_so_it_is_persisted(self):
+        """The patch has to reach disk, or a reload resurrects the dead link."""
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "miro", "https://mcp.miro.com/a")
+        slot._dirty = False
+        _emit_mcp_oauth_request(MagicMock(), slot, "miro", "https://mcp.miro.com/b")
+        assert slot._dirty is True
+
+    def test_retirement_survives_the_display_time_meta_gate(self):
+        """The retired banner must still be link-free after the read path's
+        redaction pass — that is the layer the client actually consumes."""
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "miro", "https://mcp.miro.com/a")
+        _emit_mcp_oauth_request(MagicMock(), slot, "miro", "https://mcp.miro.com/b")
+
+        prepared = _prepare_messages(list(slot.messages), running=False)
+        stale = prepared[0]
+        assert stale["meta"]["superseded"] is True
+        assert not stale["meta"].get("oauth_url")
 
 
 # ── _ChatSlot.update_message ──

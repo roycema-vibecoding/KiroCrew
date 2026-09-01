@@ -1257,13 +1257,15 @@ export function useWebSocket() {
             break
           case 'chat_message_update':
             // Server emits this for two distinct flows: tool_call_id-keyed
-            // updates from claude-agent-acp tool_call_update, and ts-keyed
+            // updates from claude-agent-acp tool_call_update, and row-keyed
             // patches for mcp_oauth banner state flips. Route by which key
-            // the payload carries.
+            // the payload carries. The row-keyed branch prefers `mid` (the
+            // server-minted row identity) over `ts`, which two restored rows
+            // can share.
             if ((data as { tool_call_id?: string }).tool_call_id) {
               dispatch(sseChatMessageUpdate(data as { slot: string; tool_call_id: string; content?: string; meta?: Record<string, unknown> }))
             } else {
-              dispatch(sseChatMessagePatchByTs(data as { slot: string; ts: string; meta?: Record<string, unknown>; content?: string }))
+              dispatch(sseChatMessagePatchByTs(data as { slot: string; ts: string; mid?: string; meta?: Record<string, unknown>; content?: string }))
             }
             break
           case 'queue_pop':

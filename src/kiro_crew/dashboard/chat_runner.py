@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -1458,6 +1459,55 @@ def _attach_turn_stats(
             break
 
 
+def _mcp_server_identity(server_name: str) -> str:
+    """A collision-resistant handle for an MCP server, safe to persist and match on.
+
+    ``server_name`` is stored REDACTED, because it is ACP-controlled and reaches
+    chat content and the WS broadcast. :func:`_redact_acp_string` maps EVERY
+    credential-shaped name onto one sentinel (``[REDACTED: credential]``), so two
+    unrelated servers can share a stored name. Matching banners on that value
+    therefore treats them as one server, and the retirement path would pop an
+    ``oauth_url`` that is still live — taking away a working link, which is worse
+    than the stale-link bug retirement exists to fix, and is exactly what the
+    rejected-URL branches refuse to do.
+
+    A digest of the RAW name separates them without carrying the name: it is
+    one-way, so it discloses nothing the redaction was hiding, and it is plain
+    lowercase hex, so ``_redact_meta_for_role``'s per-value pass leaves it intact
+    (a value that got redacted in turn would just re-collide).
+
+    Hashes ``repr(server_name)`` rather than the name itself. The name is
+    untrusted text and JSON carries a lone surrogate through ``json.loads``
+    intact, so a plain UTF-8 encode raises ``UnicodeEncodeError`` and would take
+    the whole OAuth event handler down, leaving the user no banner at all for a
+    server whose only fault is its name. ``repr`` escapes a surrogate to ASCII,
+    so no codec error handler is needed, and it stays INJECTIVE because it also
+    escapes backslashes -- ``errors="backslashreplace"`` does not, and would map
+    a name holding a lone surrogate and a name holding that surrogate's literal
+    escape text onto one digest, re-creating the very collision this key exists
+    to prevent.
+    """
+    if not server_name:
+        return ""
+    return hashlib.sha256(repr(server_name).encode("utf-8")).hexdigest()[:16]
+
+
+def _same_mcp_server(meta: dict, safe_name: str, server_key: str) -> bool:
+    """Whether an ``mcp_oauth`` row belongs to the server identified by *server_key*.
+
+    Prefers ``server_key`` — see :func:`_mcp_server_identity` for why the redacted
+    ``server_name`` is not an identity. Falls back to the name only for a LEGACY
+    row persisted before the key existed, which carries nothing better; such a row
+    keeps the old collision risk, but refusing to match it at all would instead
+    leave a genuinely dead Authorize button live forever, which is the defect this
+    module exists to close.
+    """
+    row_key = meta.get("server_key")
+    if isinstance(row_key, str) and row_key:
+        return row_key == server_key
+    return meta.get("server_name") == safe_name
+
+
 def _redact_acp_string(s: str) -> str:
     """Scrub credentials + exfil URLs from an ACP-controlled string.
 
@@ -1520,6 +1570,7 @@ def _emit_mcp_oauth_request(
     stays unconditionally visible wherever banners render.
     """
     safe_name = _redact_acp_string(server_name)
+    server_key = _mcp_server_identity(server_name)
     label = safe_name or "MCP server"
 
     if not _is_safe_oauth_url(oauth_url):
@@ -1530,6 +1581,7 @@ def _emit_mcp_oauth_request(
             "msg msg-warn",
             meta={
                 "server_name": safe_name,
+                "server_key": server_key,
                 "failed": True,
                 "rejected_url": True,
                 "error": "unsafe URL scheme",
@@ -1564,6 +1616,7 @@ def _emit_mcp_oauth_request(
             "msg msg-warn",
             meta={
                 "server_name": safe_name,
+                "server_key": server_key,
                 "failed": True,
                 "rejected_url": True,
                 "error": "URL contained credential or exfiltration pattern",
@@ -1571,8 +1624,23 @@ def _emit_mcp_oauth_request(
             },
         )
         return
+    # A new authorize request for this server means kiro-cli started a FRESH
+    # flow, and the loopback listener plus the PKCE verifier live in that flow —
+    # so every still-open banner for the same server now points at a callback
+    # port that can no longer redeem anything. Retire them before appending, or
+    # the older button stays live-looking forever and sends the browser to a
+    # dead port that answers with a bare `/?code=…` page (issue #7580).
+    #
+    # Deliberately NOT done on the two rejected-URL branches above: those append
+    # a banner with no `oauth_url`, so superseding an older one there would take
+    # away the only authorize affordance the user has and hand back nothing.
+    _supersede_open_mcp_oauth_banners(state, slot, safe_name, server_key)
     content = f"🔐 {label} requires authentication."
-    meta: dict[str, Any] = {"server_name": safe_name, "oauth_url": oauth_url}
+    meta: dict[str, Any] = {
+        "server_name": safe_name,
+        "server_key": server_key,
+        "oauth_url": oauth_url,
+    }
     if card_owned:
         meta["card_owned"] = True
     slot.append(
@@ -1581,6 +1649,90 @@ def _emit_mcp_oauth_request(
         "msg msg-info",
         meta=meta,
     )
+
+
+def _supersede_open_mcp_oauth_banners(
+    state: "DashboardState", slot: "_ChatSlot", safe_name: str, server_key: str
+) -> None:
+    """Retire every still-open mcp_oauth banner for ``safe_name``.
+
+    An authorize link is only redeemable while the kiro-cli flow that minted it
+    is alive: that process owns the loopback listener the provider redirects to
+    and the PKCE verifier the code is exchanged with. A newer request replaces
+    both, so an older open banner is unredeemable by anyone — clicking it walks
+    the user through a full provider login and lands them on a bare
+    ``http://127.0.0.1:<dead-port>/?code=…`` page that looks like success and
+    consumes nothing.
+
+    ``oauth_url`` is POPPED rather than merely flagged around, so a client that
+    does not know the ``superseded`` flag still cannot render the dead link —
+    the render layers all gate on having a URL. This mirrors the vocabulary the
+    relay already answers a dead callback port with (``approval_superseded``).
+
+    Walks the whole history rather than stopping at the first match: banners
+    accumulate one per re-announce (every session init re-emits pending
+    requests), and leaving any of them open is the defect.
+    """
+    for message in slot.messages:
+        if message.get("role") != "mcp_oauth":
+            continue
+        meta = message.get("meta") or {}
+        if not _same_mcp_server(meta, safe_name, server_key):
+            continue
+        if meta.get("completed") or meta.get("failed") or meta.get("superseded"):
+            continue
+        # Redact the RESTORED payload before it is re-emitted, for the same
+        # reason _mark_mcp_oauth_completed does: this copies a stored dict into
+        # both slot.messages and a broadcast that bypasses _prepare_messages.
+        # Safe here despite that gate being stricter than the emit-path one
+        # (see the long note in _mark_mcp_oauth_completed) because `oauth_url`
+        # is dead data on this path — it is dropped outright below and the
+        # superseded branch renders no link.
+        new_meta = _redact_meta_for_role("mcp_oauth", dict(meta))
+        new_meta.pop("oauth_url", None)
+        new_meta["superseded"] = True
+        label = safe_name or "MCP server"
+        new_content = f"↻ {label} sign-in is no longer active — a newer request replaced it."
+        row_mid = new_meta.get("mid")
+        # Resolve by `mid`, this row's server-minted identity, NOT by `ts`. That
+        # column is not an identity: `_ChatSlot.append` preserves an explicitly
+        # supplied `ts` verbatim for a row replayed from a channel transcript, and
+        # a coarse OS clock stamps two same-tick rows identically. A ts lookup
+        # resolves the FIRST match, so on a collision this loop would rewrite one
+        # row once per duplicate and leave the later banner open, still offering
+        # the dead link this function exists to withdraw.
+        if (
+            slot.update_message(
+                message.get("ts", ""),
+                content=new_content,
+                meta=new_meta,
+                mid=row_mid if isinstance(row_mid, str) else None,
+            )
+            is None
+        ):
+            continue
+        # The wire payload differs from what is PERSISTED, in two deliberate ways.
+        #
+        # `mid` travels so the CLIENT can resolve the same row the same way -- its
+        # patch reducer prefers it over `ts` for exactly the reason above.
+        #
+        # `oauth_url` is sent back as an empty string even though it is ABSENT from
+        # the persisted meta, because the client MERGES an incoming meta over the
+        # row's existing one rather than replacing it. Omitting the key would leave
+        # the live URL in place on the client row -- harmless for a client that
+        # knows `superseded`, but a tab still running pre-upgrade JS would keep
+        # rendering the dead link. An empty string fails that client's own
+        # isSafeOAuthUrl check, so the banner withdraws instead.
+        state.broadcast_ws(
+            "chat_message_update",
+            {
+                "slot": slot.key,
+                "ts": message.get("ts", ""),
+                "mid": row_mid or "",
+                "meta": {**new_meta, "oauth_url": ""},
+                "content": new_content,
+            },
+        )
 
 
 def _connections_managed_mcp_names() -> frozenset[str]:
@@ -1679,15 +1831,18 @@ def _mark_mcp_oauth_completed(
 ) -> None:
     """Patch the most recent open mcp_oauth banner for ``server_name`` to a terminal state."""
     safe_name = _redact_acp_string(server_name)
+    server_key = _mcp_server_identity(server_name)
     target: dict | None = None
     for m in reversed(slot.messages):
         if m.get("role") != "mcp_oauth":
             continue
         meta = m.get("meta") or {}
-        # Compare against the redacted form already stored on the banner.
-        if meta.get("server_name") != safe_name:
+        # Match on the collision-resistant identity, not the redacted name: two
+        # credential-shaped server names share one stored name, and flipping the
+        # wrong server's banner terminal strips the live link the user still needs.
+        if not _same_mcp_server(meta, safe_name, server_key):
             continue
-        if meta.get("completed") or meta.get("failed"):
+        if meta.get("completed") or meta.get("failed") or meta.get("superseded"):
             continue
         target = m
         break
@@ -1738,12 +1893,29 @@ def _mark_mcp_oauth_completed(
             new_meta["error"] = safe_err
     label = safe_name or "MCP server"
     new_content = f"🔓 {label} authenticated." if success else f"🚫 {label} authentication failed."
-    updated = slot.update_message(target.get("ts", ""), content=new_content, meta=new_meta)
+    # Resolve and broadcast by `mid`, the row's server-minted identity, for the
+    # same reason the supersede path does: two rows can carry one `ts`, and a ts
+    # lookup resolves the first match, so a completion could land on the wrong
+    # banner. `ts` stays in the payload and as the resolver's fallback for a legacy
+    # row written before the id existed.
+    target_mid = new_meta.get("mid")
+    updated = slot.update_message(
+        target.get("ts", ""),
+        content=new_content,
+        meta=new_meta,
+        mid=target_mid if isinstance(target_mid, str) else None,
+    )
     if updated is None:
         return
     state.broadcast_ws(
         "chat_message_update",
-        {"slot": slot.key, "ts": target.get("ts", ""), "meta": new_meta, "content": new_content},
+        {
+            "slot": slot.key,
+            "ts": target.get("ts", ""),
+            "mid": target_mid or "",
+            "meta": new_meta,
+            "content": new_content,
+        },
     )
 
 

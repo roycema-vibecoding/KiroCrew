@@ -4043,13 +4043,21 @@ class _ChatSlot:
         *,
         content: str | None = None,
         meta: dict | None = None,
+        mid: str | None = None,
     ) -> dict | None:
-        """Replace fields on a previously appended message identified by ts."""
+        """Replace fields on a previously appended message.
+
+        Identified by ``mid`` (this row's server-minted identity) when one is
+        given, falling back to ``ts``. Prefer ``mid``: two rows can carry the same
+        ``ts``, so a ts lookup resolves the first match and can patch the wrong
+        row.
+        """
         return self._buffers.update_message(
             self,
             ts,
             content=content,
             meta=meta,
+            mid=mid,
         )
 
     # ── Queue helpers (dict-based queue items) ──

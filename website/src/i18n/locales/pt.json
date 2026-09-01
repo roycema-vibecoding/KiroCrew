@@ -8841,7 +8841,8 @@
         "relay_superseded": "Esta autorização não está mais ativa. Clique em \"Autorizar\" para começar de novo.",
         "relaying": "Concluindo…",
         "remote_gateway_hint": "Em um gateway remoto, o callback localhost do navegador falhará — isso é esperado. Copie o endereço completo em que o navegador parou e cole-o aqui para concluir a autorização.",
-        "requires_authentication": "requer autenticação."
+        "requires_authentication": "requer autenticação.",
+        "superseded": "não tem mais um início de sessão ativo: uma solicitação mais recente o substituiu. Use o botão \"Autorizar\" mais recente para entrar."
       },
       "notificationItem": {
         "acknowledged": "Confirmado",

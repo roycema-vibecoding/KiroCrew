@@ -8593,7 +8593,8 @@
         "relay_superseded": "この承認は無効になりました。「認証」をクリックしてやり直してください。",
         "relaying": "完了しています…",
         "remote_gateway_hint": "リモートゲートウェイでは、ブラウザーのlocalhostコールバックは失敗します — これは想定どおりです。ブラウザーが到達した完全なアドレスをコピーしてここに貼り付け、認可を完了してください。",
-        "requires_authentication": "には認証が必要です。"
+        "requires_authentication": "には認証が必要です。",
+        "superseded": "のサインインは無効になりました。新しいリクエストによって置き換えられました。最新の「認証」ボタンからサインインしてください。"
       },
       "notificationItem": {
         "acknowledged": "確認済み",
