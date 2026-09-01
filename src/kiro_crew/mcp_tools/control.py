@@ -19,12 +19,13 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import uuid
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
-from kiro_crew import mcp_core, platform_compat, session_directive
+from kiro_crew import autonudge, mcp_core, platform_compat, session_directive
 from kiro_crew.mcp_shared import ToolCancelled, is_tool_cancelled
 from kiro_crew.mcp_tools._limits import _MONITOR_DEFAULT_MAX_CYCLES
 from kiro_crew.security import redact_and_truncate, redact_credentials, redact_exfiltration_urls
@@ -189,9 +190,7 @@ def schemas() -> list[dict[str, Any]]:
                 "properties": {
                     "questions": {
                         "type": "array",
-                        "description": (
-                            "1-4 questions to show in one card, each with 1-6 options"
-                        ),
+                        "description": ("1-4 questions to show in one card, each with 1-6 options"),
                         "items": {
                             "type": "object",
                             "properties": {
@@ -264,7 +263,19 @@ def schemas() -> list[dict[str, Any]]:
                 "loop per session; starting a new one replaces the old. "
                 "Survives gateway restarts. Every cycle appends a full turn to "
                 "this same session, so keep per-cycle output small and report "
-                "only real signals."
+                "only real signals. "
+                "COST: naming exactly ONE GitHub pull request BY ITS FULL URL "
+                "(https://github.com/<owner>/<repo>/pull/<N>) makes the loop "
+                "observe it each interval and re-inject your message only when "
+                "it actually changed, so a cycle where nothing changed costs no "
+                "model turn and max_cycles then counts the turns actually "
+                "DELIVERED to you -- wakes, plus the periodic delivery that "
+                "breaks a long quiet streak and any tick that could not observe "
+                "the subject -- rather than intervals elapsed. If your loop must "
+                "run every "
+                "interval regardless -- it acts while the subject is quiet, e.g. "
+                "refreshing a heartbeat -- do not name a single pull request, or "
+                "pass gate=false."
             ),
             "inputSchema": {
                 "type": "object",
@@ -286,6 +297,23 @@ def schemas() -> list[dict[str, Any]]:
                             "cycle whose own work runs long still pushes the "
                             "next deadline out, so real cadence is at least "
                             "interval_secs + turn time (15-86400, default 300)"
+                        ),
+                    },
+                    "gate": {
+                        "type": "boolean",
+                        "description": (
+                            "Default true. Pass false to opt this loop OUT of "
+                            "observation-gating, so it is re-injected every "
+                            "interval even when the pull request it names has "
+                            "not changed. Use it for a loop whose duty is to act "
+                            "WHILE the subject is quiet -- refresh a heartbeat "
+                            "file, chase a reviewer who still has not replied, "
+                            "keep a branch rebased on a moving base -- since the "
+                            "observation watches the pull request and continued "
+                            "silence is invisible to it. A gated loop is never "
+                            "starved (it is delivered anyway after enough quiet "
+                            "intervals) so reach for this only when every "
+                            "interval genuinely has work"
                         ),
                     },
                     "max_cycles": {
@@ -617,19 +645,21 @@ def wait(name: str, args: dict[str, Any]) -> str:
             try:
                 reply = mcp_core._post(
                     "/api/session-keepalive",
-                    {
-                        "wait_id": wait_id,
-                        "seconds": seconds,
-                        "remaining": max(0, int(remaining)),
-                        # Lets the dashboard derive a liveness window for
-                        # this sleep without importing this module's
-                        # constant -- see _service_wait_ping's collision
-                        # guard, which needs to know how stale a ping has to
-                        # be before the sleep behind it is presumed gone.
-                        "interval": _ping_secs,
-                    }
-                    if _identified
-                    else {},
+                    (
+                        {
+                            "wait_id": wait_id,
+                            "seconds": seconds,
+                            "remaining": max(0, int(remaining)),
+                            # Lets the dashboard derive a liveness window for
+                            # this sleep without importing this module's
+                            # constant -- see _service_wait_ping's collision
+                            # guard, which needs to know how stale a ping has to
+                            # be before the sleep behind it is presumed gone.
+                            "interval": _ping_secs,
+                        }
+                        if _identified
+                        else {}
+                    ),
                 )
             except Exception:
                 reply = {}  # keepalive is best-effort
@@ -639,11 +669,7 @@ def wait(name: str, args: dict[str, Any]) -> str:
             # `_identified` too: an unidentified sleep sends no wait_id, so a
             # matching reply could only mean the backend is answering about
             # somebody else's wait.
-            if (
-                _identified
-                and isinstance(reply, dict)
-                and reply.get("end_wait") == wait_id
-            ):
+            if _identified and isinstance(reply, dict) and reply.get("end_wait") == wait_id:
                 ended_early = True
                 break
             _next_ping = now + _ping_secs
@@ -892,6 +918,33 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
     # the runaway backstop; the runtime budget is for callers that need a
     # hard TIME bound (e.g. "babysit this for at most 2 hours").
     max_runtime_secs = int(args.get("max_runtime_secs") or 0)
+    # The one escape from gating, and deliberately an opt-OUT. An opt-IN is what
+    # this change exists to stop shipping: five consecutive opt-in mechanisms
+    # measured zero adoption, because the default never moved. An opt-out does
+    # not share that failure -- the default gates everything, and this only
+    # releases the minority of loops whose duty is to act WHILE the subject is
+    # quiet (refresh a heartbeat, chase a silent reviewer, rebase onto a moving
+    # base). Those loops previously had no control but the wording of their own
+    # instruction, which is a fragile thing to key a cadence on.
+    gate = args.get("gate")
+    gate = True if gate is None else bool(gate)
+    # Infer from the message AS IT WILL BE STORED. The authorizer redacts
+    # exfiltration URLs and credentials at its own chokepoint before persisting,
+    # so a subject named by a URL the redactor rewrites survives here but not
+    # there -- and the ack would then promise gating for a loop that is armed
+    # ungated. Applying the same transform first makes the disclosure describe
+    # the loop that will actually exist.
+    stored_message, _ = redact_exfiltration_urls(message)
+    stored_message, _ = redact_credentials(stored_message)
+    gated = autonudge.infer_monitor(stored_message, time.time()) if gate else None
+    # Say whether this loop will be GATED, in the ack, at the surface that armed
+    # it. This calls the SCHEDULER'S OWN decision function rather than
+    # re-deriving the answer from the target: a subject can infer cleanly and
+    # still fail to form a valid monitor, so a second evaluation could claim a
+    # gate the loop never got -- and a disclosure that can be wrong is worse than
+    # none. Without any disclosure the ack promises a plain re-injection "every
+    # {interval}s", which for a gated loop is untrue, and this whole change
+    # exists because a cadence change nobody could see had no effect.
     return _emit_directive(
         "monitor_start",
         {
@@ -899,21 +952,21 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
             "idle_secs": interval_secs,
             "max_cycles": max_cycles,
             "max_runtime_secs": max_runtime_secs,
+            "gate": gate,
         },
         (
-            "Monitor loop requested on this session: the message will "
-            f"re-inject every {interval_secs}s (user messages defer a due "
+            "Monitor loop requested on this session: "
+            + (
+                f"observing {gated.target} every {interval_secs}s and "
+                "re-injecting the message only when it changes, so quiet cycles "
+                f"cost no turn and the {max_cycles or 0} cap counts delivered turns"
+                if gated is not None
+                else f"the message will re-inject every {interval_secs}s"
+            )
+            + " (user messages defer a due "
             "fire to their turn's end without restarting the countdown)"
-            + (
-                f", stopping after {max_cycles} cycles"
-                if max_cycles
-                else ", with NO cycle cap"
-            )
-            + (
-                f", wall-clock budget {max_runtime_secs}s"
-                if max_runtime_secs
-                else ""
-            )
+            + (f", stopping after {max_cycles} cycles" if max_cycles else ", with NO cycle cap")
+            + (f", wall-clock budget {max_runtime_secs}s" if max_runtime_secs else "")
             + ". End your turn now; once the loop is armed it wakes you on "
             "that interval — but arming happens when this turn's result is "
             "processed, and only a live dashboard/Slack/Discord session can "

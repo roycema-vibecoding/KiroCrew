@@ -214,6 +214,10 @@ async def _monitor_start(state: Any, session_key: str, args: dict[str, Any]) -> 
     idle_secs = int(args.get("idle_secs") or 300)
     max_cycles = int(args.get("max_cycles") or 0)
     max_runtime_secs = int(args.get("max_runtime_secs") or 0)
+    # Absent means gated, matching the tool's default: a directive written before
+    # the flag existed must not read as an opt-out.
+    raw_gate = args.get("gate")
+    gate = True if raw_gate is None else bool(raw_gate)
     loop, error, _status = await authorize_and_add_nudge(
         svc=svc,
         state=state,
@@ -225,6 +229,7 @@ async def _monitor_start(state: Any, session_key: str, args: dict[str, Any]) -> 
         max_runtime_secs=max_runtime_secs,
         source="mcp-directive",
         caller="session-directive",
+        gate=gate,
     )
     if error is not None:
         # The authorizer already audited its own refusal; the wrapper's record

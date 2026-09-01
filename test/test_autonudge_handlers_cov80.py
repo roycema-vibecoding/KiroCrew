@@ -194,6 +194,46 @@ async def test_start_rejects_a_non_integer_max_cycles(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
+async def test_start_carries_the_gate_opt_out_to_the_authorizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """This is the route the dashboard arms through, so the escape must exist here.
+
+    An opt-out offered on only one of the arming surfaces is not an opt-out.
+    """
+    _svc(monkeypatch, _FakeSvc())
+    authorize = AsyncMock(return_value=(_loop("lp-new"), None, 200))
+    monkeypatch.setattr(h, "authorize_and_add_nudge", authorize)
+
+    await h.api_autonudge_start(
+        _mk("POST", "/api/autonudge", body={"slot_key": "s", "message": "m", "gate": False})
+    )
+    assert authorize.await_args.kwargs["gate"] is False
+
+    authorize.reset_mock()
+    await h.api_autonudge_start(
+        _mk("POST", "/api/autonudge", body={"slot_key": "s", "message": "m"})
+    )
+    assert authorize.await_args.kwargs["gate"] is False, (
+        "absent must mean UNGATED on this route: its only caller is the goal popover, "
+        "where the work is usually not a pull request even when the instruction names "
+        "one -- gating on that mention would deactivate a recurring task when the PR "
+        "closed. An earlier version of this test asserted the opposite; only "
+        "monitor_start's own directive has the evidence to gate by default."
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_refuses_a_non_boolean_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`"false"` is truthy, so coercing it would gate a loop that asked not to be."""
+    _svc(monkeypatch, _FakeSvc())
+    request = _mk("POST", "/api/autonudge", body={"slot_key": "s", "gate": "false"})
+    response = await h.api_autonudge_start(request)
+    assert response.status == 400
+    assert _body(response)["code"] == "not_a_boolean"
+
+
+@pytest.mark.asyncio
 async def test_start_passes_coerced_values_to_the_authorizer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

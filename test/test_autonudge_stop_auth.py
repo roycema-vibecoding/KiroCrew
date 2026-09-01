@@ -74,6 +74,10 @@ def test_monitor_start_returns_directive_with_validated_payload(default_install)
         "idle_secs": 300,
         "max_cycles": 5,
         "max_runtime_secs": 0,
+        # Whether the loop may be observation-gated. Always present and True
+        # unless the caller opted out, so whichever surface applies this
+        # directive reads the same decision the ack reported.
+        "gate": True,
     }
 
 

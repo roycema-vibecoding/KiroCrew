@@ -218,6 +218,11 @@ async def authorize_and_add_nudge(
     max_runtime_secs: int = 0,
     source: str,
     caller: str = "",
+    # UNGATED by default: this chokepoint is shared with callers whose work is not
+    # a pull request (an app's own timer, a goal loop), and inferring a monitor from
+    # a message that merely mentions one PR throttles those and can deactivate them
+    # outright. The monitor_start surfaces pass ``gate=True`` themselves.
+    gate: bool = False,
 ) -> tuple[Any | None, str | None, int]:
     """Validate + authorize + arm a nudge loop; return ``(loop, error, status)``.
 
@@ -454,6 +459,7 @@ async def authorize_and_add_nudge(
             stop_sentinel_path=stop_sentinel_path,
             max_runtime_secs=int(max_runtime_secs),
             admission_check=admission_check,
+            gate=gate,
         )
     except NudgeAdmissionRefused:
         return _deny("session changed before nudge arm committed", 409)

@@ -202,6 +202,71 @@ class MonitorState:
     input_tokens: int = 0
     output_tokens: int = 0
     consecutive_provider_errors: int = 0
+    #: Adoption metering. Without these two numbers a probe gate that never
+    #: fires and a probe gate that is doing its job are indistinguishable from
+    #: the outside -- which is how the earlier attempts at this saving stayed at
+    #: zero adoption, unnoticed, for over a week. ``quiet_ticks`` is the count of
+    #: observations that cost no model turn; ``wakes`` the count that did.
+    quiet_ticks: int = 0
+    wakes: int = 0
+    #: Ticks where the gate could not decide and the loop fired on its plain
+    #: timer instead. Counted apart from ``wakes`` so the metering cannot
+    #: flatter itself: a gate that is permanently broken would otherwise read as
+    #: a busy, well-used watch.
+    gate_fallbacks: int = 0
+    #: Ticks still owed to the agent after a wake, during which the gate is
+    #: bypassed and the loop fires on its plain timer.
+    #:
+    #: A woken agent usually cannot finish inside one turn -- it reads the
+    #: findings, fixes some, and needs another turn to finish. The probe cannot
+    #: see any of that: it watches the SUBJECT, so an agent that was woken and
+    #: has not yet pushed produces no observable change, and a pure gate would
+    #: report "nothing happened" and starve the work it just started. Firing once
+    #: more after every wake costs one turn per wake and removes that stall
+    #: entirely, which is the right trade against a watch that goes quiet holding
+    #: half-finished work.
+    followup_ticks: int = 0
+    #: Consecutive quiet observations since the last delivered turn.
+    #:
+    #: The gate watches the SUBJECT, so a loop whose duty is to act WHILE the
+    #: subject is quiet -- refresh a heartbeat file, chase a reviewer who still
+    #: has not replied, keep a branch rebased on a moving base -- produces no
+    #: observable change and would never be delivered again. Inference cannot
+    #: tell that intent from the wording, and guessing it is worse than bounding
+    #: it: after enough consecutive quiet ticks the loop is delivered anyway.
+    quiet_streak: int = 0
+    #: Turns delivered because the quiet streak hit its floor rather than because
+    #: anything was observed. Counted apart from wakes so the metering does not
+    #: report a periodic delivery as a real signal.
+    floor_ticks: int = 0
+    #: True from just before a probe runs until its verdict has been consumed.
+    #:
+    #: The kernel commits its dedupe state BEFORE raising a wake, which is right
+    #: for the cron driver -- there the raise IS the delivery. For a driver that
+    #: awaits the verdict, the two come apart: cancel the await (a gateway
+    #: shutdown lands mid-poll) and the observation is recorded as reported while
+    #: no turn was ever dispatched, so the next run reads the same state as
+    #: unchanged and the real signal is lost until the streak floor.
+    #:
+    #: Finding this flag still set on the next tick therefore means "a poll was
+    #: interrupted and its result may already have been consumed on disk" -- so
+    #: that tick fires instead of trusting a quiet verdict. Being wrong costs one
+    #: turn; being silent costs the signal.
+    poll_in_flight: bool = False
+    #: Non-empty when the subject is terminal but the final turn owed to a CHANNEL
+    #: loop has not been delivered yet. The VALUE is the outcome to record once it
+    #: has (``"success"`` for a merge, ``"blocked"`` for a close without merging),
+    #: so the classification survives the wait without a second field and without
+    #: writing ``outcome`` early.
+    #:
+    #: A channel-bound loop learns its watch finished from a delivered turn, not
+    #: from the dashboard notification, so settling before that turn lands would
+    #: leave an inactive loop with nothing to re-arm the moment the channel is
+    #: busy -- and a busy thread is the ordinary case. The settlement therefore
+    #: waits: this marker is what stops the retry from re-announcing forever, and
+    #: because no outcome is recorded in the meantime a restart in the window finds
+    #: a plain live loop rather than one tagged as finished and refused revival.
+    terminal_pending: str = ""
     next_probe_at: float = 0.0
     outcome: MonitorOutcome | None = None
     stopped_reason: str = ""
@@ -231,10 +296,30 @@ class MonitorState:
             "input_tokens",
             "output_tokens",
             "consecutive_provider_errors",
+            "quiet_ticks",
+            "wakes",
+            "gate_fallbacks",
+            "followup_ticks",
+            "quiet_streak",
+            "floor_ticks",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
+        # NORMALISED, not validated, and normalised toward DOUBT rather than
+        # through ``bool()``. This flag means "a turn may be owed"; a stored ``""``
+        # or ``0`` is a record we cannot read, and ``bool("")`` would clear the
+        # fail-safe and let a quiet verdict suppress a turn that was owed. Refusing
+        # the monitor outright is worse -- it takes a working watch down -- so an
+        # unreadable value becomes True and costs at most one turn.
+        if not isinstance(self.poll_in_flight, bool):
+            self.poll_in_flight = True
+        # The marker carries an outcome name, so an unreadable value cannot be
+        # guessed. Keep it PENDING and record the cautious classification: a
+        # delivery still happens, and a subject wrongly called blocked prompts a
+        # look rather than a false all-clear.
+        if not isinstance(self.terminal_pending, str):
+            self.terminal_pending = "blocked" if self.terminal_pending else ""
         if not isinstance(self.budgets, MonitorBudgets):
             raise ValueError("budgets must be MonitorBudgets")
         if (

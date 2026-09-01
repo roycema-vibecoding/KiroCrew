@@ -100,7 +100,12 @@ async def api_autonudge_get(request: web.Request) -> web.Response:
 async def api_autonudge_start(request: web.Request) -> web.Response:
     """POST /api/autonudge — start or replace a loop on a slot.
 
-    Body: { slot_key, message, idle_secs?, max_cycles?, max_runtime_secs?, stop_sentinel_path? }
+    Body: { slot_key, message, idle_secs?, max_cycles?, max_runtime_secs?,
+            stop_sentinel_path?, gate? }
+
+    ``gate`` defaults to FALSE here: this route arms whatever the goal popover was
+    given, and only ``monitor_start`` has the evidence to gate by default. Pass
+    ``gate: true`` to probe-gate a loop armed through this route.
     """
     svc = _autonudge_get()
     if svc is None:
@@ -139,6 +144,24 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "idle_secs, max_cycles and max_runtime_secs must be integers"}, status=400
         )
+    # The gating opt-out has to exist HERE too, not only on the MCP tool: this is
+    # ABSENT MEANS UNGATED on this route, unlike the monitor_start tool. This is a
+    # GENERIC arming route: its only caller is the goal popover, where a person
+    # types a recurring instruction whose work is usually NOT a pull request. Such
+    # an instruction routinely mentions one anyway ("keep driving PR #42"), and
+    # gating on that mention throttles the task to the quiet-streak floor and, when
+    # that PR is closed or merged, DEACTIVATES a recurring task that had nothing to
+    # do with it. The evidence for gating by default is about monitor_start, whose
+    # directive sets `gate: true` itself; extending it here was reach, twice.
+    #
+    # A non-boolean is still refused rather than coerced: `"false"` is truthy and
+    # would silently gate a loop that asked not to be.
+    raw_gate = body.get("gate")
+    if raw_gate is not None and not isinstance(raw_gate, bool):
+        return web.json_response(
+            {"error": "gate must be a boolean", "code": "not_a_boolean"}, status=400
+        )
+    gate = False if raw_gate is None else raw_gate
     loop, error, status = await authorize_and_add_nudge(
         svc=svc,
         state=state,
@@ -150,6 +173,7 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
         max_runtime_secs=max_runtime_secs,
         source="dashboard",
         caller=request.remote or "",
+        gate=gate,
     )
     if error is not None:
         return web.json_response({"error": error, "code": "autonudge_not_armed"}, status=status)

@@ -1144,6 +1144,10 @@ MONITOR_START_SCHEMA = ToolSchema(
         FieldSpec("interval_secs", int, min_val=15, max_val=86400),
         FieldSpec("max_cycles", int, min_val=0, max_val=1000),
         FieldSpec("max_runtime_secs", int, min_val=0, max_val=604800),
+        # Opt-OUT of observation gating. Absent means gated, matching the tool's
+        # default, so a caller written before this field existed keeps the
+        # default behaviour rather than silently escaping it.
+        FieldSpec("gate", bool),
     ],
 )
 
