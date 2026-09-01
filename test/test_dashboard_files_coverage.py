@@ -44,6 +44,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from tmpdir_helpers import short_tmp_base
 
+from kiro_crew import atomic_write as atomic_write_mod
 from kiro_crew import platform_compat
 from kiro_crew.dashboard.handlers import files as files_mod
 
@@ -321,32 +322,72 @@ class TestFileWrite:
         assert f.read_text(encoding="utf-8") == "kept"
 
     @pytest.mark.asyncio
-    async def test_replace_failure_is_500_and_cleans_up_temp(self, tmp_path, mock_sel):
+    @pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "by-name"])
+    async def test_replace_failure_is_500_and_cleans_up_temp(self, tmp_path, mock_sel, pinned):
+        """A failed publish is a 500 that leaves the original intact and no temp.
+
+        Run over BOTH publish branches, because they are different syscalls with
+        different cleanup: with a pinned parent descriptor ``atomic_write``
+        publishes with ``renameat`` (``os.rename`` plus ``src_dir_fd``/
+        ``dst_dir_fd``) and reclaims the temp with ``os.unlink(name, dir_fd=)``,
+        while the by-name floor publishes with ``os.replace`` and unlinks by path.
+
+        The capability probe is FORCED rather than left to the host, and that is
+        load-bearing in both directions. ``pinned_parent_replace_supported()``
+        answers ``os.rename in os.supports_dir_fd``, and a patched ``os.rename``
+        is a mock that is not in that frozenset — so patching the syscall alone
+        would flip the probe to False and quietly exercise the by-name floor
+        twice. Forcing it also keeps the pinned case from depending on the host
+        having ``openat``. The ``_mkstemp_at`` spy asserts which stager really
+        ran, so neither case can drift onto the other's branch unnoticed.
+        """
         f = tmp_path / "doomed.md"
         f.write_text("original", encoding="utf-8")
-        with patch.object(os, "replace", side_effect=OSError("replace failed")):
+        doomed = "rename" if pinned else "replace"
+        with patch.object(
+            atomic_write_mod, "pinned_parent_replace_supported", lambda: pinned
+        ), patch.object(
+            atomic_write_mod, "_mkstemp_at", wraps=atomic_write_mod._mkstemp_at
+        ) as staged_at, patch.object(
+            os, doomed, side_effect=OSError(f"{doomed} failed")
+        ):
             async with TestClient(TestServer(self._client_app())) as client:
                 resp = await client.post(
                     "/api/file-write", json={"path": str(f), "content": "never lands"}
                 )
                 assert resp.status == 500
                 assert (await resp.json())["error"] == "failed to write file"
+        assert staged_at.call_count == (1 if pinned else 0)
         assert f.read_text(encoding="utf-8") == "original"
         assert [p.name for p in tmp_path.iterdir()] == ["doomed.md"]
 
     @pytest.mark.asyncio
-    async def test_temp_unlink_failure_still_reports_500(self, tmp_path, mock_sel):
+    @pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "by-name"])
+    async def test_temp_unlink_failure_still_reports_500(self, tmp_path, mock_sel, pinned):
         """The cleanup ``os.unlink`` is itself wrapped: its OSError is swallowed
-        so the caller still gets the real 500 rather than an unhandled error."""
+        so the caller still gets the real 500 rather than an unhandled error.
+
+        Both branches again: the pinned cleanup passes ``dir_fd=`` and the
+        by-name one does not, so a swallowed failure has to be proven on each.
+        """
         f = tmp_path / "twice.md"
         f.write_text("original", encoding="utf-8")
-        with patch.object(os, "replace", side_effect=OSError("replace failed")), \
-             patch.object(os, "unlink", side_effect=OSError("unlink failed")):
+        doomed = "rename" if pinned else "replace"
+        with patch.object(
+            atomic_write_mod, "pinned_parent_replace_supported", lambda: pinned
+        ), patch.object(
+            atomic_write_mod, "_mkstemp_at", wraps=atomic_write_mod._mkstemp_at
+        ) as staged_at, patch.object(
+            os, doomed, side_effect=OSError(f"{doomed} failed")
+        ), patch.object(
+            os, "unlink", side_effect=OSError("unlink failed")
+        ):
             async with TestClient(TestServer(self._client_app())) as client:
                 resp = await client.post(
                     "/api/file-write", json={"path": str(f), "content": "nope"}
                 )
                 assert resp.status == 500
+        assert staged_at.call_count == (1 if pinned else 0)
         # The scratch file survives here precisely because unlink was blocked.
         leftovers = [p for p in tmp_path.iterdir() if p.name != "twice.md"]
         for p in leftovers:

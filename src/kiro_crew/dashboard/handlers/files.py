@@ -28,7 +28,7 @@ from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 from aiohttp.multipart import BodyPartReader
 
-from kiro_crew import platform_compat
+from kiro_crew import pinned_fs, platform_compat
 from kiro_crew.atomic_write import atomic_write, open_access_control_source
 from kiro_crew.config import loader as config_loader
 from kiro_crew.config.loader import KiroCrewConfig, WorkspaceConfig, config_dir, data_home
@@ -2872,6 +2872,30 @@ def _file_write_blocking(path: str, content: str) -> str | None:
         src_fd = open_access_control_source(path)
     except OSError:
         return "notfound"
+    # Pin the parent chain and hand atomic_write the descriptor so its temp
+    # create and publishing rename run relative to it. ``path`` is realpath-
+    # canonicalized, so the leaf is symlink-free; the residual window is an
+    # ancestor swapped between that realpath and the mkstemp/replace, which the
+    # pinned parent closes. None on a platform without openat, where atomic_write
+    # keeps the by-name floor -- the same platform that cannot pin at all.
+    dir_fd: int | None = None
+    if pinned_fs.supports_pinned_walk():
+        try:
+            dir_fd = pinned_fs.open_dir_pinned(os.path.dirname(path), what="file directory")
+        except pinned_fs.PinnedPathRefusal:
+            if src_fd is not None:
+                try:
+                    os.close(src_fd)
+                except OSError:
+                    pass
+            return "notfound"
+        except OSError:
+            if src_fd is not None:
+                try:
+                    os.close(src_fd)
+                except OSError:
+                    pass
+            return "notfound"
     try:
         src_stat = os.fstat(src_fd) if src_fd is not None else os.stat(path)
         # mode= keeps the previous copymode behaviour (permission bits), and
@@ -2885,11 +2909,17 @@ def _file_write_blocking(path: str, content: str) -> str | None:
             content,
             mode=_stat_mod.S_IMODE(src_stat.st_mode),
             preserve_access_control_from=src_fd,
+            parent_dir_fd=dir_fd,
         )
     finally:
         if src_fd is not None:
             try:
                 os.close(src_fd)
+            except OSError:
+                pass
+        if dir_fd is not None:
+            try:
+                os.close(dir_fd)
             except OSError:
                 pass
     return None

@@ -1341,8 +1341,25 @@ set so repeat calls don't re-resolve.
 
 **CRUD operations** (via `SkillsLoader`):
 - `create_skill(name, content)` — creates `{name}/SKILL.md`, supports nested paths
-- `update_skill(name, content)` — overwrites existing SKILL.md
+- `update_skill(name, content)` — REPLACES the SKILL.md inode via `atomic_write()`
+  rather than writing through the existing one, so the document survives a write
+  that fails part-way. A hardlink to the old inode, or a handle already open on
+  it, therefore keeps seeing the pre-update bytes.
 - `delete_skill(name)` — removes entire skill directory
+- All three address the leaf relative to a descriptor pinning the parent chain
+  (`pinned_fs`) where the platform has the descriptor-relative syscalls, so an
+  ancestor swapped for a link after resolution cannot redirect the write. Windows
+  keeps the by-name floor.
+- On the pinned branch `create_skill` lands the skill directory at `0o700` and its
+  `SKILL.md` at `0o600` — `pinned_fs.create_and_open_dir_pinned` and an explicit
+  `O_CREAT` mode, matching steering's create — where the by-name floor still gets
+  the umask default. Strictly tighter, and stated because `~/.kiro/crew/skills` is
+  a directory operators share with other tooling. `update_skill` preserves the
+  target's existing bits either way.
+- `update_skill` / `delete_skill` return `False` for a REFUSED target as well as a
+  missing one — a parent that cannot be pinned, or an access-control source that
+  cannot be opened `O_NOFOLLOW` — which the dashboard reports as its existing 404.
+  Callers must not read `False` as "the name does not exist".
 - Path traversal protection: `_safe_name()` rejects `..` and `\` (allows `/` for nesting)
 
 **Foreign-agent import:** only user-authored skills are eligible. Imported

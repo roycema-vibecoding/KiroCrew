@@ -20,8 +20,8 @@ from itertools import zip_longest
 from pathlib import Path
 from typing import Callable, Iterator
 
-from kiro_crew import skill_trust
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew import pinned_fs, skill_trust
+from kiro_crew.atomic_write import atomic_write, open_access_control_source
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.cron import referenced_skill_names
 from kiro_crew.frontmatter import SKILL_LOADER, parse_frontmatter
@@ -48,6 +48,15 @@ logger = logging.getLogger(__name__)
 
 SKILLS_DIR_NAME = "skills"
 _MIN_TRIGGER_OVERLAP = 0.7
+
+# Whether skill CRUD can address the skill directory and its SKILL.md relative to
+# a pinned parent descriptor. supports_pinned_walk covers the openat capability;
+# unlink/rmdir are probed on top because delete removes the file and directory
+# relative to the pinned descriptor. Where this is False (Windows) the by-name
+# create/write/rmtree are the floor, unchanged.
+_DIR_FD_SUPPORTED = pinned_fs.supports_pinned_walk() and {os.unlink, os.rmdir}.issubset(
+    os.supports_dir_fd
+)
 
 
 def _matches_any(path: str, globs: list[str]) -> bool:
@@ -2315,8 +2324,45 @@ class SkillsLoader:
         skill_dir = self._dir / name
         if skill_dir.exists():
             return False
-        skill_dir.mkdir(parents=True, exist_ok=True)
-        (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
+        if not _DIR_FD_SUPPORTED:
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
+            self._invalidate_iter_cache()  # so the new skill shows in list_skills() now
+            logger.info("Created skill: %s", name)
+            return True
+
+        # Ensure the intermediate tree by name (a nested skill name has parents
+        # the caller owns), then create the leaf skill dir and its SKILL.md
+        # relative to a pinned descriptor so an ancestor swapped for a link after
+        # the exists() check cannot redirect the write. must_create refuses a
+        # skill dir that appeared in the meantime, matching the exists() guard.
+        skill_dir.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            dir_fd = pinned_fs.create_and_open_dir_pinned(
+                skill_dir, what="skill directory", must_create=True
+            )
+        except pinned_fs.PinnedPathRefusal:
+            return False
+        try:
+            fd = os.open(
+                "SKILL.md",
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_BINARY", 0),
+                0o600,
+                dir_fd=dir_fd,
+            )
+            try:
+                data = content.encode("utf-8")
+                written = 0
+                while written < len(data):
+                    written += os.write(fd, data[written:])
+            finally:
+                os.close(fd)
+        finally:
+            os.close(dir_fd)
         self._invalidate_iter_cache()  # so the new skill shows in list_skills() now
         logger.info("Created skill: %s", name)
         return True
@@ -2325,12 +2371,77 @@ class SkillsLoader:
         """Overwrite an existing skill's SKILL.md.  Returns True if found."""
         if not self._safe_name(name):
             return False
-        skill_file = self._dir / name / "SKILL.md"
+        skill_dir = self._dir / name
+        skill_file = skill_dir / "SKILL.md"
         if not skill_file.exists():
             return False
-        skill_file.write_text(content, encoding="utf-8")
+        if not _DIR_FD_SUPPORTED:
+            if not self._write_skill_md(skill_file, content, dir_fd=None):
+                return False
+            self._invalidate_iter_cache()  # so the edit is reflected in list_skills() now
+            logger.info("Updated skill: %s", name)
+            return True
+
+        # Pin the skill directory so the atomic replace stages and renames
+        # through the walked descriptor rather than by name.
+        try:
+            dir_fd = pinned_fs.open_dir_pinned(skill_dir, what="skill directory")
+        except pinned_fs.PinnedPathRefusal:
+            return False
+        except OSError:
+            return False
+        try:
+            if not self._write_skill_md(skill_file, content, dir_fd=dir_fd):
+                return False
+        finally:
+            os.close(dir_fd)
         self._invalidate_iter_cache()  # so the edit is reflected in list_skills() now
         logger.info("Updated skill: %s", name)
+        return True
+
+    @staticmethod
+    def _write_skill_md(skill_file: Path, content: str, *, dir_fd: int | None) -> bool:
+        """Atomically replace *skill_file*, carrying its access-control xattrs.
+
+        Routes through ``atomic_write`` with the same ACL carry the steering and
+        file-write update paths use: ``mode=`` alone reproduces permission BITS
+        only, so a named POSIX ACL the owner set on a skill's SKILL.md would be
+        dropped the moment the replace installs a fresh inode. When *dir_fd* is a
+        pinned parent the temp create and rename run relative to it.
+
+        Returns False when the target is REJECTED -- the source open failed, so
+        there is no inode to carry from. A write failure still raises.
+        """
+        try:
+            src_fd = open_access_control_source(skill_file)
+        except OSError:
+            # The same disposition the steering and file-write updates give this:
+            # a rejected target, not a server fault. Continuing with src_fd=None
+            # would publish a fresh inode carrying only the permission bits, so a
+            # named POSIX ACL the owner set on this SKILL.md would be dropped and
+            # the file handed back protected differently from the one it replaced
+            # -- silently, on the one path that was supposed to fix that.
+            return False
+        try:
+            mode = (
+                stat.S_IMODE(os.fstat(src_fd).st_mode)
+                if src_fd is not None
+                else stat.S_IMODE(skill_file.stat().st_mode)
+            )
+            atomic_write(
+                skill_file,
+                content,
+                mode=mode,
+                newline="",
+                preserve_access_control_from=src_fd,
+                parent_dir_fd=dir_fd,
+            )
+        finally:
+            if src_fd is not None:
+                try:
+                    os.close(src_fd)
+                except OSError:
+                    pass
         return True
 
     def delete_skill(self, name: str) -> bool:
@@ -2339,6 +2450,30 @@ class SkillsLoader:
             return False
         skill_dir = self._dir / name
         if not skill_dir.is_dir():
+            return False
+        if _DIR_FD_SUPPORTED:
+            # A recursive descriptor-relative delete is out of proportion for a
+            # skill dir, so the residual guarded here is narrower: pin the parent,
+            # answer "is this name a real directory?" from a descriptor-relative
+            # lstat, and only then rmtree. The is_dir() above FOLLOWS a link, so a
+            # symlinked skill dir reaches this point; shutil.rmtree then refuses it
+            # with an OSError the caller would surface as a 500 instead of the
+            # not-found the by-name floor gives. A directory swapped for a link
+            # after this check is the remaining window -- recorded, and the by-name
+            # floor below carries the same posture.
+            try:
+                parent_fd = pinned_fs.open_dir_pinned(skill_dir.parent, what="skill directory")
+            except pinned_fs.PinnedPathRefusal:
+                return False
+            except OSError:
+                return False
+            try:
+                st = pinned_fs.stat_at(parent_fd, skill_dir.name)
+                if st is None or not stat.S_ISDIR(st.st_mode):
+                    return False
+            finally:
+                os.close(parent_fd)
+        elif is_link_or_junction(skill_dir):
             return False
         shutil.rmtree(skill_dir)
         self._invalidate_iter_cache()  # so the removal is reflected in list_skills() now
