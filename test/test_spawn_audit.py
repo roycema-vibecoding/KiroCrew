@@ -760,6 +760,26 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "apps/builtins/dev_fleet/npm_preflight.py::_extract",
         "apps/builtins/dev_fleet/npm_preflight.py::_install_already_proven",
         "apps/builtins/dev_fleet/npm_preflight.py::probe",
+        # frontend_skip decides whether a backend-only sync may skip the frontend
+        # build, and derives the provenance record that decision compares against.
+        # It has two callers, and neither gets a wrap: the Dev Fleet backend (which
+        # runs the derivation after a sync exits zero), and the sync RUNNER, which
+        # loads it from a digest-verified by-path snapshot. Unlike npm_preflight
+        # above, the runner is not already inside a sandbox of our making — only
+        # the step argvs go through sandboxed_spawn_argv, never the runner process
+        # — so this spawn is allowlisted on the strength of its argv rather than of
+        # an outer sandbox.
+        #
+        # _git_stdout is the module's ONE spawn point, it is not
+        # agent-influenced, and it only READS: `<git> -C <repo> rev-parse
+        # HEAD:website` and `<git> -C <repo> status --porcelain
+        # --untracked-files=all -- website`. The binary reaching this function came
+        # from _trusted_bin (never PATH) in both callers; the repo is the
+        # operator-configured checkout; the revision is the literal HEAD, and every
+        # subcommand, flag and pathspec is a module-level constant. A
+        # filesystem-scoped wrapper would also break it for nothing: its whole
+        # output is on stdout.
+        "apps/builtins/dev_fleet/frontend_skip.py::_git_stdout",
         # Foreground last-resort restart (Make Live on hosts with no drivable
         # service manager): a detached `kirocrew restart --port <marker port>`,
         # fixed argv whose binary is validated (basenamed kirocrew, absolute,

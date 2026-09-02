@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import logging
 import os
 import shlex
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew import platform_compat
-from kiro_crew.apps.builtins.dev_fleet import npm_preflight
+from kiro_crew.apps.builtins.dev_fleet import frontend_skip, npm_preflight
 from kiro_crew.env import find_node_tool, node_bin_dirs
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.loop_lock import LoopBoundLock
@@ -637,6 +638,42 @@ try:
 except OSError:  # pragma: no cover - frozen/zipimported install
     _PREFLIGHT_SOURCE = None
 
+#: The frontend-skip decision's source, captured ONCE at import for the SAME
+#: reason and by the SAME mechanism as ``_PREFLIGHT_SOURCE`` above.
+#:
+#: :mod:`frontend_skip` decides at RUNTIME, inside the generated sync runner,
+#: whether a backend-only Pull+Build may skip the frontend build. The decision
+#: needs HEAD to already name the revision being landed, which is not true until
+#: the sync's own ``merge --ff-only`` step has run, so it cannot be made when the
+#: step list is assembled -- it is made in the runner. The runner is stdlib-only
+#: and must not import ``kiro_crew``, so this helper (which imports only the
+#: stdlib) is executed BY PATH from a pre-merge snapshot, exactly like the
+#: preflight and dep_sync snapshots.
+#:
+#: ``None`` when the source cannot be read (frozen/zipimported install). Unlike
+#: the preflight, this does NOT refuse the sync: the skip is a pure optimization,
+#: so a missing snapshot means the runner simply never skips (it runs the build
+#: as it does today) -- the conservative, always-correct fallback.
+try:
+    _FRONTEND_SKIP_SOURCE: bytes | None = Path(frontend_skip.__file__).read_bytes()
+except OSError:  # pragma: no cover - frozen/zipimported install
+    _FRONTEND_SKIP_SOURCE = None
+
+#: sha256 of :data:`_FRONTEND_SKIP_SOURCE`, baked into the runner's script text so
+#: the runner can verify the snapshot it is about to execute.
+#:
+#: The snapshot sits in a 0o700 mkdtemp, which stops another local USER from
+#: substituting it but not a sync step running at OUR uid: ``/tmp`` is listable, so
+#: an ``npm ci`` lifecycle script can find the directory and overwrite the helper
+#: with one whose ``may_skip_frontend`` returns ``True`` unconditionally. The
+#: decision CODE is an input to the verdict exactly as the record is, so it gets
+#: the same treatment -- it must arrive over a channel no step can write, and the
+#: script text (in the runner's argv, which a step can read but not modify) is that
+#: channel. ``None`` alongside a ``None`` source: no snapshot, no marker, no skip.
+_FRONTEND_SKIP_DIGEST: str | None = (
+    hashlib.sha256(_FRONTEND_SKIP_SOURCE).hexdigest() if _FRONTEND_SKIP_SOURCE else None
+)
+
 #: Label of the ONE sync step whose binary is ours, so its exit code can be
 #: trusted to mean what :mod:`npm_preflight` says it means. Every other step runs
 #: worktree-controlled code and can exit any number it likes, so a reserved code
@@ -649,6 +686,68 @@ except OSError:  # pragma: no cover - frozen/zipimported install
 #: dependencies" reads as work. The runner's trust gate compares against this
 #: constant, so the display name and the gate cannot drift apart.
 _PREFLIGHT_LABEL = "Verify dependencies"
+
+#: The two frontend step labels, named once so the assembly, the skip marker and
+#: the runner all agree. ``npm ci`` deletes and reinstalls website/node_modules;
+#: ``npm build + stage`` runs the vite build and re-stages the dist.
+#:
+#: Only the BUILD is a skip candidate. ``npm ci`` stays unconditional because
+#: whether the on-disk ``node_modules`` is the tree it would produce cannot be
+#: verified below the cost of running it -- npm's own hidden lockfile is metadata
+#: nothing reconciles with the files it describes -- and because it is the step
+#: that repairs such a tree. See :mod:`frontend_skip`.
+_NPM_CI_LABEL = "npm ci"
+_BUILD_STAGE_LABEL = "npm build + stage"
+
+#: The step-dict key the runner consults to decide, at runtime, whether a step
+#: may be skipped on a backend-only sync. Mirrors how ``stash`` is attached to a
+#: step dict and read inside the generated runner loop. Its VALUE carries what
+#: the runtime check needs -- the helper snapshot and its expected digest, the git
+#: binary, the repo, and the recorded ``(tree, dist)`` pair itself -- and its
+#: presence is also the signal that the runner has a skip decision to make for
+#: this step (a step without the key is never a skip candidate -- e.g. every step
+#: on an edition checkout, where the frontend steps are not even in the list).
+_SKIP_MARKER = "skip_if_frontend_unchanged"
+
+#: The frontend build's provenance record, per checkout: absolute repo path ->
+#: ``(website/ tree OID, staged-dist digest)`` produced by :func:`_start_run` after
+#: a sync run exited zero. :mod:`frontend_skip` compares a candidate skip against
+#: it; ``worktree_ops`` bakes the pair into the runner's own script text.
+#:
+#: IN MEMORY IS THE POINT, and it is the whole security argument for the skip. The
+#: record is a historical CLAIM that a MORE TRUSTED process acts on: the sync
+#: runner, which is not sandbox-wrapped, and this backend. The steps that run
+#: before the gated build execute code from the revision being landed --
+#: ``pip install -e .`` runs its build backend, ``npm ci`` runs every dependency's
+#: lifecycle scripts -- at the same uid, and both fields are computable by that
+#: code (the tree OID from git, the digest by ``staged_dist_digest``'s documented
+#: walk). So a record on disk is a record such a step can forge: stage a bundle of
+#: its own choosing, vouch for it as this revision's, and the build that would
+#: have overwritten it is skipped while the sync reports success.
+#:
+#: A durable record cannot be protected from that at any acceptable price, which
+#: is why there is no file. Confining the steps away from it is not available: on
+#: every shipped configuration this backend is itself spawned through
+#: ``sandbox.wrap_argv`` (see ``apps/backend.py``), so it already carries
+#: ``KIROCREW_SANDBOX_ACTIVE`` -- and ``wrap_argv`` then takes its nested
+#: passthrough, which returns BEFORE ``extra_hidden_dirs`` is consulted and hands
+#: the step the argv unchanged. Inside that one namespace there is no path this
+#: backend can write and its own steps cannot. A MAC over the pair only moves the
+#: problem: a key on disk is readable at the same uid, and a key in memory dies
+#: with the backend -- which is exactly the durability a file was for.
+#:
+#: What that costs is one frontend build per checkout per backend lifetime, and
+#: what it buys is that the class has no branch left: no sandbox backend, an
+#: unsandboxed opt-in, and Windows all reach the same verdict as Linux with
+#: namespaces, because the verdict no longer depends on confinement at all.
+_FRONTEND_BUILD_RECORDS: dict[str, tuple[str, str]] = {}
+
+#: Bound on :data:`_FRONTEND_BUILD_RECORDS`, in the spirit of
+#: ``_RUNS_MAX_COMPLETED``: one entry per checkout ever synced by this backend, and
+#: a fleet has a handful, so the cap only exists so a long-lived backend cannot
+#: grow the dict without limit. Oldest insertion is evicted, which at worst costs
+#: that checkout's next sync a frontend build.
+_FRONTEND_BUILD_RECORDS_MAX = 32
 
 
 def _parse_step_marker(text: str) -> tuple[int | None, str | None]:
@@ -669,6 +768,71 @@ def _parse_step_marker(text: str) -> tuple[int | None, str | None]:
     return idx, label
 
 
+async def _refresh_frontend_build_record(repo: str) -> None:
+    """Re-derive :data:`_FRONTEND_BUILD_RECORDS` for *repo* after a good sync.
+
+    Called only from :func:`_start_run`, only for a ``sync`` run that neither timed
+    out nor exited non-zero. What makes the pair trustworthy is the exit code of a
+    script whose steps are ours, never anything the run PRINTED: the child's stdout
+    also carries worktree-controlled build output, so a "the build ran" marker in it
+    could be forged by an install script that prints the marker and then fails.
+
+    The record is REPLACED, including with nothing: a run that succeeded while
+    leaving ``website/`` dirty, or with an unreadable ``static/dist``, must not
+    leave an older pair standing as if it described the bundle now on disk.
+
+    Off the loop: this spawns git twice and walks the whole staged bundle, which
+    the event loop must not block on. Every failure is swallowed with a log -- the
+    run has already succeeded, and a missed refresh only costs the next sync a
+    frontend build.
+
+    Under ``_SYNC_LOCK``, because the two halves of the pair must describe the SAME
+    moment. This runs after the run record already says ``done``, which is what the
+    single-flight check reads, so without the lock the NEXT sync can begin -- fetch
+    and ``merge --ff-only`` included -- while this is still reading. It would then
+    pair the new HEAD's ``website/`` tree OID with a bundle built from the old one,
+    and if that sync went on to fail before its own build the forged pair would
+    stand: a later sync landing the same tree would skip and serve a bundle no build
+    of that tree produced. Holding the sync's own gate makes the read atomic against
+    a sync start, and costs nothing -- the gate is held only for a sync's assembly,
+    never across its run.
+    """
+
+    def _derive() -> tuple[str, str] | None:
+        # Resolved here rather than threaded in from the caller so the whole
+        # derivation -- the trusted-path vetting included -- happens off the loop.
+        # An unresolvable git answers ``None``, which drops the record: the same
+        # conservative outcome as a dirty tree, and the same one the skip needs.
+        git = _trusted_bin("git")
+        if git is None:
+            return None
+        return frontend_skip.build_record(git, repo)
+
+    try:
+        async with _SYNC_LOCK:
+            record = await asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(), _derive
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.info(
+            "dev-fleet: could not re-derive the frontend build record for %s (%s); "
+            "the next sync will rebuild the frontend",
+            repo,
+            exc,
+        )
+        return
+    if record is None:
+        _FRONTEND_BUILD_RECORDS.pop(repo, None)
+        return
+    # Insertion-ordered eviction, so a backend that syncs many checkouts cannot grow
+    # this without bound. Re-inserting moves an existing key to the end, which is
+    # what keeps the checkout being synced from evicting itself.
+    _FRONTEND_BUILD_RECORDS.pop(repo, None)
+    while len(_FRONTEND_BUILD_RECORDS) >= _FRONTEND_BUILD_RECORDS_MAX:
+        _FRONTEND_BUILD_RECORDS.pop(next(iter(_FRONTEND_BUILD_RECORDS)))
+    _FRONTEND_BUILD_RECORDS[repo] = record
+
+
 async def _start_run(
     label: str,
     cmd: list[str],
@@ -676,11 +840,16 @@ async def _start_run(
     cwd: str | None = None,
     env: dict | None = None,
     cleanup_paths: list[str] | None = None,
+    frontend_record_repo: str | None = None,
 ) -> str:
     """Start a background subprocess with output streaming and watchdog.
 
     ``cleanup_paths``: sandbox launcher/profile temp files from
     ``sandboxed_spawn_argv`` — deleted when the run finishes.
+
+    ``frontend_record_repo``: the checkout whose frontend-build provenance record
+    this run establishes, threaded from the sync alone the same way
+    ``cleanup_paths`` is. See :func:`_refresh_frontend_build_record`.
     """
     rid = uuid.uuid4().hex[:12]
     # The run KIND, captured before the output loop can touch it. `label` is
@@ -838,6 +1007,27 @@ async def _start_run(
                         cause = npm_preflight.explain_exit(rc)
                         if cause:
                             _RUNS[rid]["cause"] = cause
+            # The frontend-build provenance record, refreshed here for the same
+            # reason the diagnosis above is derived here: from the exit code of a
+            # script whose steps are OURS, and never from anything the child
+            # PRINTED. That stream carries worktree-controlled build output too, so
+            # a "the frontend was built" marker in it could be forged by an install
+            # script that prints the marker and then fails.
+            #
+            # Gated on the run KIND as well: only the sync runs the build+stage
+            # step, and a `provision` run executes an agent-authored branch that
+            # could otherwise vouch for a bundle no build of ours produced.
+            #
+            # `not timed_out` is not redundant with `rc == 0`: the timeout path
+            # kills the child and stamps exit_code -1 on the record, but the LOCAL
+            # `rc` is whatever the killed process actually reported, so neither
+            # signal alone is sufficient.
+            #
+            # Outside the _RUNS_LOCK deliberately: the refresh spawns git and walks
+            # the whole staged bundle, and holding the lock across that would stall
+            # every reader of the run list.
+            if frontend_record_repo and run_kind == _SYNC_RUN_LABEL and not timed_out and rc == 0:
+                await _refresh_frontend_build_record(frontend_record_repo)
         except asyncio.CancelledError:
             # Gateway shutdown cancels in-flight run tasks. The child runs in
             # its own process group and would outlive us, continuing to mutate
@@ -1064,10 +1254,16 @@ __all__ = (
     "PodConfig",
     "_ACTIVE_RUNS",
     "_BUILD_PATH_CACHE",
+    "_BUILD_STAGE_LABEL",
+    "_FRONTEND_BUILD_RECORDS",
+    "_FRONTEND_BUILD_RECORDS_MAX",
+    "_FRONTEND_SKIP_DIGEST",
+    "_FRONTEND_SKIP_SOURCE",
     "_GIT_ENV_NEUTRALIZERS",
     "_GIT_ERR_MAX",
     "_GIT_TRUSTED_HELPERS",
     "_KEYCHAIN_HELPER_NAMES",
+    "_NPM_CI_LABEL",
     "_POD_AVAILABLE",
     "_POD_ERROR",
     "_POD_IMPORTED",
@@ -1082,6 +1278,7 @@ __all__ = (
     "_SANDBOX_ERR_MAX",
     "_SHUTDOWN_ADMISSION_LOCK",
     "_SHUTDOWN_IN_PROGRESS",
+    "_SKIP_MARKER",
     "_SYNC_LOCK",
     "_SYNC_RUN_LABEL",
     "_TRUSTED_BIN_CACHE",

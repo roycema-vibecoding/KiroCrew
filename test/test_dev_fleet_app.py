@@ -62,6 +62,31 @@ def _venv_maps_to_the_synced_checkout():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _sync_snapshots_land_under_the_test_tmpdir(tmp_path, monkeypatch):
+    """Root the sync's by-path snapshots in this test's own temp directory.
+
+    ``_sync_start_locked`` stages its stdlib-only helpers (the preflight probe and
+    the frontend-skip decision) with ``tempfile.mkdtemp`` and registers every one
+    for removal in the run's ``finally``. Every sync test here stubs
+    ``_start_run``, so that ``finally`` never executes and each staged directory
+    outlives the test — a leak no tidier product code can close, because the run
+    that would have destroyed them never starts. Re-rooting the temp base is what
+    keeps the suite off the host: a test destroys what it creates, in its own scope.
+
+    Re-rooting the BASE rather than replacing ``tempfile.mkdtemp`` is the whole
+    point. Sibling tests here monkeypatch ``mkdtemp`` itself to drive a staging
+    failure, and a fixture holding its own patch on that same attribute is
+    restored in an order nobody controls: ``monkeypatch`` undo re-installs the
+    value it captured — the fixture's replacement — after the fixture has already
+    put the real function back, leaving a closure over a deleted directory
+    installed for the rest of the worker. ``tempfile.tempdir`` has no other writer
+    at this scope, so it cannot invert that way, and an explicit ``dir=`` still
+    wins for the tests that pass one.
+    """
+    monkeypatch.setattr(worktree_ops_mod.tempfile, "tempdir", str(tmp_path))
+
+
 # --- worktree porcelain parsing ---
 def test_parse_worktree_porcelain_basic():
     from kiro_crew.apps.builtins.dev_fleet.server import _parse_worktree_porcelain
@@ -939,7 +964,7 @@ async def test_sync_script_emits_step_markers():
          patch.object(worktree_ops_mod, "_venv_python", return_value=Path("/fake/.venv/bin/python")), \
          patch.object(runtime_mod, "_trusted_bin", side_effect=lambda n: f"/usr/bin/{n}"), \
          patch("kiro_crew.apps.builtins.dev_fleet.worktree_ops.sandboxed_spawn_argv",
-               side_effect=lambda cmd, mode, env=None: (cmd, env or {}, None)), \
+               side_effect=lambda cmd, mode, env=None, **_kw: (cmd, env or {}, None)), \
          patch.object(runtime_mod, "_start_run", new_callable=AsyncMock, return_value="run-123") as mock_start:
         async with mod._SYNC_LOCK:
             result = await mod._sync_start_locked()
@@ -947,7 +972,8 @@ async def test_sync_script_emits_step_markers():
     cmd_args = mock_start.call_args[0]
     script_cmd = cmd_args[1]
     assert script_cmd[0].endswith("python") or "python" in script_cmd[0]
-    script_src = script_cmd[2]
+    # The script is the LAST element: interpreter flags (`-I`) precede `-c`.
+    script_src = script_cmd[-1]
     assert "::step::" in script_src
     assert "print(f" in script_src
     repository_mod._UPSTREAM_REMOTE = None
@@ -999,10 +1025,40 @@ _SYNC_REPO = "/fake/main-checkout"
 #: other way, and asserting on it is how a leaked snapshot gets caught.
 _LAST_CLEANUP_PATHS: list[str] = []
 
+#: The full runner ARGV from the last ``_run_sync``, not just its script. The
+#: interpreter flags carry an invariant of their own (``-I``, which keeps the
+#: merged checkout off the runner's import path), and ``_run_sync``'s return value
+#: deliberately exposes only the script.
+_LAST_SYNC_CMD: list[str] = []
 
-async def _run_sync(mod, locked):
+#: The keyword arguments the last ``_run_sync`` passed to ``sandboxed_spawn_argv``
+#: for each wrapped step. Recorded so a test can assert on what the wrap does NOT
+#: carry: the frontend skip must not ask the wrap for anything, because an app
+#: backend's ``extra_hidden_dirs`` is silently dropped by ``wrap_argv``'s nested
+#: passthrough (see ``test_sandbox_argv``), so a mask requested here would be a
+#: documented control that enforces nothing.
+_LAST_SYNC_WRAP_KWARGS: list[dict] = []
+
+#: The frontend build record ``_run_sync`` seeds into
+#: ``runtime._FRONTEND_BUILD_RECORDS`` for the repo under test. The marker is
+#: attached only when the backend holds a record for that checkout, so without this
+#: every marker test would silently run the honest cold-start path (no marker at
+#: all) and assert nothing.
+_SYNC_SEEDED_RECORD = ("a" * 40, "b" * 64)
+
+#: Every keyword argument the last ``_run_sync`` passed to ``_start_run``. The
+#: harness stubs ``_start_run`` itself, so a test cannot patch it to look at these.
+_LAST_SYNC_START_KWARGS: dict = {}
+
+
+async def _run_sync(mod, locked, seed_frontend_record=True):
     """Drive _sync_start_locked with the probe stubbed; return its result dict
     plus the generated script (None when the sync refused).
+
+    ``seed_frontend_record=False`` leaves ``runtime._FRONTEND_BUILD_RECORDS`` alone,
+    which is what a cold backend looks like: no record for this checkout, so no skip
+    marker. Tests about that path must use it rather than emptying the dict
+    themselves, since the seeding below would land in whatever they put there.
     MAIN_REPO is pinned because the sync refuses outright when no checkout was
     discovered, and these tests are about the sync's own behaviour: leaving it
     ambient makes them pass or fail on whether the HOST running them happens to
@@ -1014,18 +1070,43 @@ async def _run_sync(mod, locked):
     """
     repository_mod._UPSTREAM_REMOTE = "origin"
     worktree_ops_mod._SYNC_RID = None
+    _LAST_SYNC_WRAP_KWARGS.clear()
+
+    def _wrap(cmd, mode, env=None, **kw):
+        _LAST_SYNC_WRAP_KWARGS.append(dict(kw))
+        return cmd, env or {}, None
+
+    # The record the backend would hold for this checkout after an earlier good
+    # sync. Seeded rather than derived: it lives in memory, so a test that wants
+    # the skip marker present puts it there the same way _start_run would.
+    if seed_frontend_record:
+        runtime_mod._FRONTEND_BUILD_RECORDS[_SYNC_REPO] = _SYNC_SEEDED_RECORD
+
+    async def _fake_git(_repo, *args, **_kw):
+        return "main"
+
     with patch.object(repository_mod, "MAIN_REPO", _SYNC_REPO), \
-         patch.object(repository_mod, "_git", new_callable=AsyncMock, return_value="main"), \
+         patch.object(repository_mod, "_git", new_callable=AsyncMock, side_effect=_fake_git), \
          patch.object(worktree_ops_mod, "_venv_python", return_value=Path("/fake/.venv/bin/python")), \
          patch.object(runtime_mod, "_trusted_bin", side_effect=lambda n: f"/usr/bin/{n}"), \
          patch.object(worktree_ops_mod.dep_sync, "locked_console_scripts", return_value=locked), \
          patch("kiro_crew.apps.builtins.dev_fleet.worktree_ops.sandboxed_spawn_argv",
-               side_effect=lambda cmd, mode, env=None: (cmd, env or {}, None)), \
+               side_effect=_wrap), \
          patch.object(runtime_mod, "_start_run", new_callable=AsyncMock, return_value="run-123") as mock_start:
         async with mod._SYNC_LOCK:
             result = await mod._sync_start_locked()
     repository_mod._UPSTREAM_REMOTE = None
-    script = mock_start.call_args[0][1][2] if mock_start.call_args else None
+    # The record is a module global, so it must not survive the test that seeded it:
+    # left behind, it would hand a marker to a later test that is about the
+    # cold-start path and make that test pass for the wrong reason.
+    runtime_mod._FRONTEND_BUILD_RECORDS.pop(_SYNC_REPO, None)
+    # The script is the LAST argv element, not a fixed index: the runner argv
+    # carries interpreter flags before `-c` (`-I`, which keeps the merged checkout
+    # off the runner's sys.path), and a positional index silently hands every test
+    # here a flag string instead of the script when one is added.
+    script = mock_start.call_args[0][1][-1] if mock_start.call_args else None
+    global _LAST_SYNC_CMD
+    _LAST_SYNC_CMD = list(mock_start.call_args[0][1]) if mock_start.call_args else []
     # Stubbing _start_run also stubs out its `finally` cleanup, so anything the
     # sync staged for removal (the dependency-only path snapshots dep_sync into a
     # temp dir) would outlive the test. Remove exactly what it registered, in the
@@ -1035,6 +1116,9 @@ async def _run_sync(mod, locked):
         (mock_start.call_args.kwargs.get("cleanup_paths") or [])
         if mock_start.call_args else []
     )
+    _LAST_SYNC_START_KWARGS.clear()
+    if mock_start.call_args:
+        _LAST_SYNC_START_KWARGS.update(mock_start.call_args.kwargs)
     if mock_start.call_args:
         for path in mock_start.call_args.kwargs.get("cleanup_paths") or []:
             try:
@@ -1190,6 +1274,589 @@ async def test_sync_runner_pins_utf8_stdout_before_its_first_print():
 
     assert "reconfigure(encoding='utf-8'" in script
     assert script.index("reconfigure(") < script.index("print(f'::step::")
+
+
+@pytest.mark.asyncio
+async def test_sync_runner_runs_isolated_so_the_merged_tree_is_off_its_import_path():
+    """The runner interpreter carries `-I`, and that is a security boundary.
+
+    `python -c` puts the inherited cwd at sys.path[0], AHEAD of the stdlib, and the
+    cwd a module-style app backend hands down is the gateway's own source root —
+    which on the editable install Dev Fleet manages IS the tree being synced. The
+    runner performs an import AFTER its merge step (the by-path load of the
+    frontend-skip snapshot, whose own `import hashlib` resolves through sys.path
+    like any other), and the runner process is NOT sandbox-wrapped: only the step
+    argvs go through sandboxed_spawn_argv. Without `-I`, `src/hashlib.py` in the
+    incoming revision runs arbitrary code there, outside the per-step sandbox.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    _, script = await _run_sync(mod, [])
+
+    assert script is not None
+    cmd = _LAST_SYNC_CMD
+    assert cmd[0] == sys.executable, cmd
+    # The flags between the interpreter and `-c`, which is the last thing before
+    # the script itself.
+    assert cmd[-2] == "-c", cmd
+    assert "-I" in cmd[1:-2], cmd
+
+
+@pytest.mark.asyncio
+async def test_runner_isolation_keeps_a_poisoned_cwd_out_of_a_by_path_load(tmp_path):
+    """Prove the mechanism with the runner's OWN flags, not their presence in a list.
+
+    Runs the flags the sync actually passes against the shape the runner uses — a
+    module loaded by path whose top-level `import hashlib` resolves through
+    sys.path — from a working directory carrying a `hashlib.py` that writes a file
+    when executed. The stdlib must win and the payload must not run.
+    """
+    import subprocess
+
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    await _run_sync(mod, [])
+    flags = _LAST_SYNC_CMD[1:-2]
+
+    poisoned = tmp_path / "checkout-src"
+    poisoned.mkdir()
+    (poisoned / "hashlib.py").write_text(
+        "import pathlib\n"
+        "pathlib.Path(__file__).with_name('PAYLOAD-RAN').write_text('x')\n"
+        "def sha256(_b):\n"
+        "    raise AssertionError('shadowed hashlib was used')\n",
+        encoding="utf-8",
+    )
+    # The by-path snapshot: what `exec_module` runs, and the only import the runner
+    # performs after untrusted content has landed.
+    snapshot = tmp_path / "snap" / "helper.py"
+    snapshot.parent.mkdir()
+    snapshot.write_text("import hashlib\nWHERE = hashlib.__file__\n", encoding="utf-8")
+
+    body = (
+        "import importlib.util as u\n"
+        f"spec = u.spec_from_file_location('helper', {json.dumps(str(snapshot))})\n"
+        "m = u.module_from_spec(spec)\n"
+        "spec.loader.exec_module(m)\n"
+        "print(m.WHERE)\n"
+    )
+    # cwd under tmp_path, never the repo root a child would otherwise inherit from
+    # pytest: the payload writes beside itself, and this is where it must not land.
+    proc = subprocess.run(
+        [sys.executable, *flags, "-c", body],
+        cwd=str(poisoned),
+        capture_output=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")
+    assert not (poisoned / "PAYLOAD-RAN").exists(), "checkout code ran in the runner"
+    assert str(poisoned) not in proc.stdout.decode(errors="replace")
+
+
+# --- backend-only sync: skip the frontend build at runtime ---
+# The vite build+stage is elided on a sync that lands a website/ tree already
+# built and served, and the decision has to be made at RUNTIME: it needs the
+# website/ tree OID of the fetched ref, which is not on disk when the step list
+# is assembled. `npm ci` is deliberately NOT a candidate. These pin that both
+# steps are still ASSEMBLED, that only the build carries the marker, what that
+# marker carries, that the runner records provenance only after the step
+# succeeds, that a staging failure degrades instead of aborting, and that the
+# edition path is untouched.
+
+
+@pytest.mark.asyncio
+async def test_sync_still_assembles_both_frontend_steps_on_a_stock_checkout(monkeypatch):
+    """The skip is a RUNTIME decision, not an assembly-time omission.
+
+    Both frontend steps must still be in the step list on a stock checkout, in
+    their existing order, so the credential-tier and stash invariants that key
+    off them are unchanged; the runner is what decides at runtime whether to run
+    or skip them.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setattr(worktree_ops_mod.frontend, "edition_configured", lambda: False)
+
+    _, script = await _run_sync(mod, [])
+
+    labels = _steps_from_script(script)
+    assert "npm ci" in labels
+    assert "npm build + stage" in labels
+    # Order preserved: ci before build+stage, both after the merge.
+    assert labels.index("npm ci") < labels.index("npm build + stage")
+    assert labels.index("Merge") < labels.index("npm ci")
+
+
+@pytest.mark.asyncio
+async def test_sync_runner_evaluates_the_frontend_skip_against_head(monkeypatch):
+    """The generated runner decides the skip, and the revision it asks about is HEAD.
+
+    The decision cannot be made at assembly time: it needs HEAD's website/ tree
+    OID, and HEAD does not name the revision being landed until the merge step --
+    which runs inside this script -- has moved it. So it lives in the runner, as a
+    by-path load of the stdlib-only helper plus a call to may_skip_frontend that
+    forwards no revision at all: the helper resolves HEAD, the source the build
+    reads.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setattr(worktree_ops_mod.frontend, "edition_configured", lambda: False)
+
+    _, script = await _run_sync(mod, [])
+
+    # The runner loads the helper BY PATH (never imports kiro_crew) and asks it.
+    assert "marker['snapshot']" in script
+    assert "may_skip_frontend(" in script
+    # No revision is deferred into the runner -- neither an incoming ref nor a
+    # pre-merge base, both of which can name a source the build will not read.
+    assert "marker['ref']" not in script
+    assert "marker['base']" not in script
+    # The merge runs before the step the skip guards, so HEAD is already landed.
+    labels = _steps_from_script(script)
+    assert labels.index("Merge") < labels.index("npm build + stage")
+    # And it prints a skip notice naming website/ as the reason.
+    assert "skipping %s" in script and "website/" in script
+
+
+@pytest.mark.asyncio
+async def test_sync_tags_the_frontend_build_and_never_npm_ci(monkeypatch):
+    """Only the build+stage step is a skip candidate; `npm ci` never is.
+
+    Whether the on-disk node_modules is the tree `npm ci` would produce cannot be
+    verified below the cost of running it -- npm's hidden lockfile is metadata
+    nothing reconciles with the files it describes, so it stays byte-identical
+    while a package is deleted from the tree -- and `npm ci` is the step that
+    REPAIRS such a tree. So it stays unconditional, and that is pinned here
+    rather than left to a comment: tagging it is the shape of the regression.
+    Every other step (fetch, merge, pip, the preflight) must also be free of the
+    marker so it always runs.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setattr(worktree_ops_mod.frontend, "edition_configured", lambda: False)
+
+    _, script = await _run_sync(mod, [])
+
+    steps = _sync_steps_from_script(script)
+    by_label = {s["label"]: s for s in steps}
+    marked = [s["label"] for s in steps if "skip_if_frontend_unchanged" in s]
+    assert marked == ["npm build + stage"]
+    # No other step is a skip candidate -- `npm ci` above all.
+    for label in ("npm ci", "Pull", "Merge", "pip install"):
+        assert "skip_if_frontend_unchanged" not in by_label[label]
+
+
+@pytest.mark.asyncio
+async def test_sync_skip_marker_carries_the_record_itself_and_names_no_file(monkeypatch):
+    """The marker carries the recorded pair as VALUES, and no path to a record.
+
+    This is the invariant that makes the skip safe, and it is asserted on the
+    marker's KEY SET rather than on behaviour, because the failure mode is
+    additive: the moment a key naming a file comes back, an install script running
+    before the gated build can write that file. Those steps -- `pip install -e .`
+    executing the merged revision's build backend, `npm ci` running every
+    dependency's lifecycle scripts -- are same-uid code from the revision being
+    landed, and both fields of the record are computable by them (the tree OID
+    from git, the digest by frontend_skip's documented walk). So the record
+    reaches the runner inside its own script text, which such a step can read but
+    cannot modify, and it comes from the backend's own memory.
+
+    It also carries NO REVISION, and that absence is the point. The verdict is an
+    identity check on HEAD, so naming the incoming ref instead would fail OPEN:
+    `merge --ff-only <ref>` also exits zero, reporting "Already up to date",
+    whenever the ref is an ancestor of HEAD -- what a checkout carrying local
+    commits looks like -- so the ref's website/ tree is still the recorded one
+    while HEAD's has moved, and the skip would fire over a committed frontend
+    change that then never gets built. A pre-merge base OID is no better: spelled
+    "HEAD" in a runner that has already fast-forwarded, it compares the ref with
+    itself and reads empty on every successful sync.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setattr(worktree_ops_mod.frontend, "edition_configured", lambda: False)
+
+    _, script = await _run_sync(mod, [])
+
+    steps = _sync_steps_from_script(script)
+    marker = next(
+        s["skip_if_frontend_unchanged"] for s in steps if "skip_if_frontend_unchanged" in s
+    )
+    # Exactly these keys: the verified helper snapshot, the git binary, the repo,
+    # and the recorded pair. No stamp, no ref, no base OID.
+    assert set(marker) == {"snapshot", "digest", "git", "repo", "tree", "dist"}
+    # The pair is the one the BACKEND holds, baked in as two hex values.
+    assert (marker["tree"], marker["dist"]) == _SYNC_SEEDED_RECORD
+    assert "marker['tree']" in script and "marker['dist']" in script
+    assert "marker['ref']" not in script and "marker['base']" not in script
+    # And the runner neither records nor reads a record: it only decides.
+    assert "record_frontend_build" not in script
+    assert "stamp" not in script
+
+
+@pytest.mark.asyncio
+async def test_sync_does_not_ask_the_wrap_to_hide_anything(monkeypatch):
+    """The frontend skip requests no sandbox mask, because a mask here is inert.
+
+    An app backend's own ``extra_hidden_dirs`` is silently DROPPED: this backend is
+    spawned through ``sandbox.wrap_argv`` by ``apps/backend.py``, so it carries
+    KIROCREW_SANDBOX_ACTIVE, and ``wrap_argv`` then takes its nested passthrough --
+    which returns the argv unchanged BEFORE extra_hidden_dirs is consulted (pinned
+    directly in ``test_sandbox_argv``). Requesting a mask would therefore ship a
+    documented security control that enforces nothing, which is worse than not
+    having one: a reader of dev-fleet.md would believe the record is protected.
+
+    Pinned here so nobody re-derives the on-disk-record-plus-mask design. The
+    record needs no mask because it is never on disk.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setattr(worktree_ops_mod.frontend, "edition_configured", lambda: False)
+
+    await _run_sync(mod, [])
+
+    # The recorder names `env` explicitly, so anything left over is an extra the
+    # wrap was asked for -- and there must be none.
+    assert _LAST_SYNC_WRAP_KWARGS, "no step was wrapped"
+    for kwargs in _LAST_SYNC_WRAP_KWARGS:
+        assert "extra_hidden_dirs" not in kwargs
+        assert kwargs == {}, f"the step wrap was asked for {sorted(kwargs)}"
+
+
+@pytest.mark.asyncio
+async def test_sync_leaves_the_step_untagged_when_the_backend_holds_no_record(monkeypatch):
+    """No record, no marker: the honest cold-start path.
+
+    A cold Dev Fleet backend -- or one that has never synced this checkout, or whose
+    last sync could not vouch for the bundle -- holds nothing, and the build must
+    then RUN. This is the cost the in-memory record accepts (one build per checkout
+    per backend lifetime) and it must degrade to building rather than to a skip on
+    an empty pair.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setattr(worktree_ops_mod.frontend, "edition_configured", lambda: False)
+
+    _, script = await _run_sync(mod, [], seed_frontend_record=False)
+    assert _SYNC_REPO not in runtime_mod._FRONTEND_BUILD_RECORDS
+
+    steps = _sync_steps_from_script(script)
+    assert script is not None and steps, "the sync must still run"
+    assert not any("skip_if_frontend_unchanged" in s for s in steps)
+    # And nothing was staged, so the cold path does not leak the helper snapshot.
+    assert not [p for p in _LAST_CLEANUP_PATHS if "frontend-skip" in p]
+
+
+@pytest.mark.asyncio
+async def test_sync_runner_verifies_the_helper_snapshot_before_executing_it(monkeypatch):
+    """The decision CODE is an input to the verdict, so it needs the same channel.
+
+    The snapshot sits in a 0o700 mkdtemp, which stops another local USER but not a
+    sync step running at OUR uid: /tmp is listable, so an `npm ci` lifecycle script
+    can find the directory and overwrite the helper with one whose
+    may_skip_frontend returns True unconditionally. So the runner checks the bytes
+    against a digest baked into its own script text -- the one channel no step can
+    write -- and executes the VERIFIED bytes rather than re-reading the file, so
+    nothing can be swapped between the check and the load.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setattr(worktree_ops_mod.frontend, "edition_configured", lambda: False)
+
+    _, script = await _run_sync(mod, [])
+
+    steps = _sync_steps_from_script(script)
+    marker = next(
+        s["skip_if_frontend_unchanged"] for s in steps if "skip_if_frontend_unchanged" in s
+    )
+    # The digest is the real one for the bytes that were staged, not a placeholder,
+    # and it covers the module the runner will execute rather than some other file.
+    # (_run_sync removes the snapshot on the way out, standing in for the run's own
+    # cleanup, so the bytes are compared against the source they were written from.)
+    assert marker["digest"] == hashlib.sha256(runtime_mod._FRONTEND_SKIP_SOURCE).hexdigest()
+    assert marker["snapshot"] in _LAST_CLEANUP_PATHS, "the snapshot was never staged"
+    # The runner compares before it executes, and executes the bytes it checked.
+    verify_at = script.index("!= marker['digest']")
+    assert verify_at < script.index("exec(compile(data")
+    # A mismatch raises, and every failure of the check path answers "do not skip".
+    assert "was '\n                             'modified since it was staged" in script
+    assert "running the frontend '\n              'build" in script
+
+
+@pytest.mark.asyncio
+async def test_sync_passes_the_record_repo_only_when_it_owns_the_frontend(monkeypatch):
+    """A run that does not build the frontend must not vouch for the bundle.
+
+    On an edition checkout the build+stage step is not in the step list at all, so
+    the run establishes nothing about what is served and must not refresh the
+    record. `frontend_record_repo` is what carries that decision into
+    ``_start_run``, threaded from the sync alone the way ``cleanup_paths`` is.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    for edition, expected in ((False, _SYNC_REPO), (True, None)):
+        monkeypatch.setattr(worktree_ops_mod.frontend, "edition_configured", lambda e=edition: e)
+        _, script = await _run_sync(mod, [])
+
+        assert _LAST_SYNC_START_KWARGS.get("frontend_record_repo") == expected, (
+            f"edition_configured={edition} must pass " f"frontend_record_repo={expected!r}"
+        )
+        # And the two really are different runs: only the non-edition one builds.
+        has_build = runtime_mod._BUILD_STAGE_LABEL in _steps_from_script(script)
+        assert has_build is (not edition)
+
+
+@pytest.mark.asyncio
+async def test_start_run_refreshes_the_record_only_on_a_clean_sync_exit(monkeypatch):
+    """The record is derived from the EXIT CODE of a sync run, and nothing else.
+
+    Three gates, each with its own failure it exists to prevent, and all of them
+    driven end to end rather than read out of the source (the sibling diagnosis gate
+    shipped a defect that only running it caught):
+
+    * `rc == 0` -- a failed build, including the `tsc -b` failure that leaves
+      website/dist byte-identical to the staged copy, must not produce a record, or
+      the next backend-only sync skips and reports success having never built.
+    * the run KIND -- only the sync runs the build+stage step; a `provision` run
+      executes an agent-authored branch that could otherwise vouch for a bundle no
+      build of ours produced.
+    * the child's stdout is never consulted. It carries worktree-controlled build
+      output, so a "the frontend was built" marker in it could be forged by an
+      install script that prints the marker and then fails.
+    """
+    calls: list[str] = []
+
+    async def fake_refresh(repo):
+        calls.append(repo)
+
+    monkeypatch.setattr(runtime_mod, "_refresh_frontend_build_record", fake_refresh)
+
+    # (kind, exit code, stdout the child prints) -> does it refresh?
+    cases = [
+        ("sync", 0, [b"::step::0::4::Pull\n"], True),
+        ("sync", 1, [b"::step::0::4::Pull\n"], False),
+        # A forged claim on the one channel the gate must not read.
+        ("sync", 1, [b"frontend build complete\n", b"record_frontend_build\n"], False),
+        ("provision wt-x", 0, [], False),
+    ]
+    for kind, code, lines, expected in cases:
+        calls.clear()
+
+        class FakeProc:
+            pid = 4343
+            returncode = None
+
+            def __init__(self):
+                self.stdout = self
+                self._lines = list(lines)
+
+            async def readline(self):
+                return self._lines.pop(0) if self._lines else b""
+
+            async def wait(self):
+                self.returncode = code
+                return code
+
+        async def fake_exec(*a, **k):
+            return FakeProc()
+
+        monkeypatch.setattr(runtime_mod.asyncio, "create_subprocess_exec", fake_exec)
+        rid = await mod._start_run(kind, ["true"], env={}, frontend_record_repo=_SYNC_REPO)
+        for _ in range(80):
+            await runtime_mod.asyncio.sleep(0.05)
+            async with mod._RUNS_LOCK:
+                if mod._RUNS.get(rid, {}).get("status") not in (None, "running"):
+                    break
+
+        assert calls == (
+            [_SYNC_REPO] if expected else []
+        ), f"kind={kind!r} rc={code} refreshed={calls!r}, expected={expected}"
+
+    # And a run that was not handed a repo never refreshes, whatever it exits with.
+    calls.clear()
+    rid = await mod._start_run("sync", ["true"], env={})
+    for _ in range(80):
+        await runtime_mod.asyncio.sleep(0.05)
+        async with mod._RUNS_LOCK:
+            if mod._RUNS.get(rid, {}).get("status") not in (None, "running"):
+                break
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_holds_the_sync_gate_so_the_next_sync_cannot_race_it(monkeypatch):
+    """The two halves of the pair must describe the same moment.
+
+    The refresh runs after the run record already says `done`, which is what the
+    single-flight check reads -- so without the sync's own gate the NEXT sync can
+    begin (fetch and `merge --ff-only` included) while the derivation is still
+    reading. It would then pair the new HEAD's website/ tree OID with a bundle built
+    from the old one, and if that sync failed before its own build the forged pair
+    would stand: a later sync landing the same tree skips and serves a bundle no
+    build of that tree produced.
+
+    Asserted by observing the lock DURING the derivation, since the ordering is the
+    whole property and a test that only checks the result would pass either way.
+    """
+    monkeypatch.setattr(runtime_mod, "_trusted_bin", lambda n: f"/usr/bin/{n}")
+    monkeypatch.setattr(runtime_mod, "_FRONTEND_BUILD_RECORDS", {})
+    held: list[bool] = []
+
+    def _derive(git, repo):
+        held.append(runtime_mod._SYNC_LOCK.locked())
+        return ("tree", "dist")
+
+    monkeypatch.setattr(runtime_mod.frontend_skip, "build_record", _derive)
+    await runtime_mod._refresh_frontend_build_record(_SYNC_REPO)
+
+    assert held == [True], "the derivation ran without the sync gate held"
+    # And the gate is released afterwards, or the next sync would hang forever.
+    assert not runtime_mod._SYNC_LOCK.locked()
+    assert runtime_mod._FRONTEND_BUILD_RECORDS[_SYNC_REPO] == ("tree", "dist")
+
+
+@pytest.mark.asyncio
+async def test_refresh_replaces_the_record_including_with_nothing(monkeypatch):
+    """A run that succeeded but cannot be vouched for must DROP the older pair.
+
+    Keeping it would leave a record still claiming to describe the bundle now on
+    disk -- the in-memory equivalent of a stale stamp surviving a build that could
+    not be described. `build_record` answers None for exactly those states (a dirty
+    website/, an unreadable static/dist), and the refresh must honour it by
+    removing rather than by keeping.
+    """
+    monkeypatch.setattr(runtime_mod, "_trusted_bin", lambda n: f"/usr/bin/{n}")
+    runtime_mod._FRONTEND_BUILD_RECORDS[_SYNC_REPO] = ("stale", "stale")
+    try:
+        monkeypatch.setattr(
+            runtime_mod.frontend_skip, "build_record", lambda g, r: ("fresh", "pair")
+        )
+        await runtime_mod._refresh_frontend_build_record(_SYNC_REPO)
+        assert runtime_mod._FRONTEND_BUILD_RECORDS[_SYNC_REPO] == ("fresh", "pair")
+
+        monkeypatch.setattr(runtime_mod.frontend_skip, "build_record", lambda g, r: None)
+        await runtime_mod._refresh_frontend_build_record(_SYNC_REPO)
+        assert _SYNC_REPO not in runtime_mod._FRONTEND_BUILD_RECORDS
+
+        # A raising derivation is equally harmless: the run already succeeded, so it
+        # logs and leaves nothing behind rather than failing the sync.
+        runtime_mod._FRONTEND_BUILD_RECORDS[_SYNC_REPO] = ("stale", "stale")
+
+        def _boom(git, repo):
+            raise OSError("git exploded")
+
+        monkeypatch.setattr(runtime_mod.frontend_skip, "build_record", _boom)
+        await runtime_mod._refresh_frontend_build_record(_SYNC_REPO)
+        assert runtime_mod._FRONTEND_BUILD_RECORDS[_SYNC_REPO] == ("stale", "stale")
+    finally:
+        runtime_mod._FRONTEND_BUILD_RECORDS.pop(_SYNC_REPO, None)
+
+
+@pytest.mark.asyncio
+async def test_the_record_map_is_bounded(monkeypatch):
+    """A long-lived backend cannot grow the record map without limit."""
+    monkeypatch.setattr(runtime_mod, "_trusted_bin", lambda n: f"/usr/bin/{n}")
+    monkeypatch.setattr(runtime_mod, "_FRONTEND_BUILD_RECORDS", {})
+    monkeypatch.setattr(runtime_mod.frontend_skip, "build_record", lambda g, r: ("tree", "dist"))
+
+    cap = runtime_mod._FRONTEND_BUILD_RECORDS_MAX
+    for i in range(cap + 5):
+        await runtime_mod._refresh_frontend_build_record(f"/repo/{i}")
+
+    assert len(runtime_mod._FRONTEND_BUILD_RECORDS) == cap
+    # The oldest went, the newest stayed.
+    assert "/repo/0" not in runtime_mod._FRONTEND_BUILD_RECORDS
+    assert f"/repo/{cap + 4}" in runtime_mod._FRONTEND_BUILD_RECORDS
+    # Re-recording an existing checkout must not evict it.
+    newest = f"/repo/{cap + 4}"
+    await runtime_mod._refresh_frontend_build_record(newest)
+    assert newest in runtime_mod._FRONTEND_BUILD_RECORDS
+    assert len(runtime_mod._FRONTEND_BUILD_RECORDS) == cap
+
+
+@pytest.mark.asyncio
+async def test_sync_survives_a_full_tmpdir_while_staging_the_skip_helper(monkeypatch):
+    """An unwritable TMPDIR degrades the skip; it must not abort the Pull+Build.
+
+    The staging failure is handled by logging and leaving the step untagged, so
+    the sync runs the build exactly as it does without the skip. The marker name
+    has to be bound on that path too -- the sibling assignment makes it a
+    function-local, so leaving it unbound turns the graceful-degradation branch
+    into an UnboundLocalError that aborts the whole sync.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setattr(worktree_ops_mod.frontend, "edition_configured", lambda: False)
+
+    real_mkdtemp = worktree_ops_mod.tempfile.mkdtemp
+
+    def _fail_only_the_skip_snapshot(*args, prefix="", **kwargs):
+        if prefix.startswith("kirocrew-frontend-skip-"):
+            raise OSError(28, "No space left on device")
+        return real_mkdtemp(*args, prefix=prefix, **kwargs)
+
+    with patch.object(
+        worktree_ops_mod.tempfile, "mkdtemp", side_effect=_fail_only_the_skip_snapshot
+    ):
+        result, script = await _run_sync(mod, [])
+
+    assert result["ok"] is True
+    assert script is not None
+    steps = _sync_steps_from_script(script)
+    labels = [s["label"] for s in steps]
+    # Both frontend steps are present and NEITHER is tagged, so both run.
+    assert "npm ci" in labels and "npm build + stage" in labels
+    assert not any("skip_if_frontend_unchanged" in s for s in steps)
+
+
+@pytest.mark.asyncio
+async def test_sync_runner_skips_before_the_node_modules_stash_transaction(monkeypatch):
+    """A skipped step must not take a trip through the stash transaction.
+
+    The runner `continue`s BEFORE the `node_modules` rename, so a step it decides
+    to skip cannot move the tree aside and leave it there. `npm ci` is the step
+    that transaction protects and it is never skipped, so this is defence in
+    depth for the ordering rather than a live path today — but a skip placed
+    after the rename would be exactly the destructive shape the transaction
+    exists to prevent.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setattr(worktree_ops_mod.frontend, "edition_configured", lambda: False)
+
+    _, script = await _run_sync(mod, [])
+
+    # The skip `continue` appears before the stash rename in the step loop body.
+    skip_at = script.index("if marker and may_skip_frontend(marker)")
+    stash_at = script.index("os.rename(stash, backup)")
+    assert skip_at < stash_at
+
+
+@pytest.mark.asyncio
+async def test_sync_frontend_skip_is_a_no_op_on_an_edition_checkout():
+    """On an edition checkout the frontend steps are absent, so the skip cannot
+    fire and must not interfere.
+
+    frontend_half is false on an edition composition root, so neither npm step
+    is assembled and nothing carries the skip marker — the runtime skip is a
+    guarded no-op there. The backend half (fetch, merge, pip) is untouched.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with patch.object(worktree_ops_mod.frontend, "edition_configured", return_value=True):
+        _, script = await _run_sync(mod, [])
+
+    steps = _sync_steps_from_script(script)
+    labels = [s["label"] for s in steps]
+    # No frontend steps at all, hence nothing to skip.
+    assert "npm ci" not in labels
+    assert "npm build + stage" not in labels
+    assert not any("skip_if_frontend_unchanged" in s for s in steps)
+    # No step carries the marker, so the runner's `st.get(SKIP_MARKER)` is None
+    # for every step and may_skip_frontend is never invoked — a guarded no-op.
+    assert all(s.get("skip_if_frontend_unchanged") is None for s in steps)
+    # Backend half is still there.
+    assert "Pull" in labels and "Merge" in labels and "pip install" in labels
 
 
 def test_utf8_reconfigure_survives_a_legacy_codepage_pipe():
@@ -5884,7 +6551,7 @@ async def test_sync_pip_uses_target_repo_venv(monkeypatch, tmp_path):
     monkeypatch.setattr(runtime_mod, "_trusted_bin", lambda n: f"/usr/bin/{n}")
     captured: dict = {}
 
-    def fake_sandboxed(argv, mode, env=None):
+    def fake_sandboxed(argv, mode, env=None, **_kw):
         captured.setdefault("argvs", []).append(list(argv))
         return list(argv), dict(env or {}), None
 
@@ -7684,7 +8351,7 @@ async def test_sync_builds_and_stages_under_one_lock_holder(monkeypatch, tmp_pat
     monkeypatch.setattr(runtime_mod, "_trusted_bin", lambda n: f"/usr/bin/{n}")
     argvs: list[list[str]] = []
 
-    def fake_sandboxed(argv, mode, env=None):
+    def fake_sandboxed(argv, mode, env=None, **_kw):
         argvs.append(list(argv))
         return list(argv), dict(env or {}), None
 
@@ -9789,15 +10456,21 @@ async def test_only_the_sync_kind_can_be_stamped_with_a_diagnosis(monkeypatch):
     )
 
 
-def test_the_stamp_gate_reads_a_name_the_step_handler_cannot_rebind():
-    """The gate must not read a variable the output loop assigns to.
+def test_every_kind_gate_reads_a_name_the_step_handler_cannot_rebind():
+    """No kind gate may read a variable the output loop assigns to.
 
     This is the defect that shipped once: ``label`` is the function parameter
     AND the ``::step::`` handler's target, so at completion it held the last
-    step's label or was unbound. Whatever the gate compares has to be assigned
+    step's label or was unbound. Whatever a gate compares has to be assigned
     exactly once, which is checked here on the parse tree rather than by counting
     substrings -- the first version of this test counted ``run_kind =`` and
     matched ``run_kind ==`` too.
+
+    Applied to EVERY gate rather than to a single expected one. ``_start_run`` has
+    more than one thing to gate on the run kind (the failure diagnosis, and the
+    frontend build record), and pinning the count would make adding the next one a
+    red test instead of checking it -- which is the wrong way round, since a new
+    gate is exactly what needs this property verified.
     """
     import ast
     import inspect
@@ -9805,7 +10478,7 @@ def test_the_stamp_gate_reads_a_name_the_step_handler_cannot_rebind():
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(mod._start_run)))
 
-    # The name the gate actually compares against.
+    # The names the kind gates actually compare against.
     gates = [
         n for n in ast.walk(tree)
         if isinstance(n, ast.Compare)
@@ -9815,8 +10488,7 @@ def test_the_stamp_gate_reads_a_name_the_step_handler_cannot_rebind():
             for c in n.comparators
         )
     ]
-    assert len(gates) == 1, f"expected one kind gate, found {len(gates)}"
-    guarded = gates[0].left.id
+    assert gates, "no kind gate found; the diagnosis stamp must be gated on the kind"
 
     targets = [
         t.id
@@ -9825,15 +10497,18 @@ def test_the_stamp_gate_reads_a_name_the_step_handler_cannot_rebind():
         for t in ast.walk(n.target if hasattr(n, "target") else n.targets[0])
         if isinstance(t, ast.Name)
     ]
-    assert targets.count(guarded) == 1, (
-        f"{guarded!r} is assigned {targets.count(guarded)} times in "
-        "_start_run; the gate's variable must be bound once, before any output "
-        "is read, or a later handler can rebind it out from under the gate"
-    )
-    assert guarded not in {a.arg for a in tree.body[0].args.args}, (
-        f"{guarded!r} is the parameter itself -- use a local captured at entry, "
-        "so a handler that rebinds the parameter cannot reach the gate"
-    )
+    params = {a.arg for a in tree.body[0].args.args} | {a.arg for a in tree.body[0].args.kwonlyargs}
+    for gate in gates:
+        guarded = gate.left.id
+        assert targets.count(guarded) == 1, (
+            f"{guarded!r} is assigned {targets.count(guarded)} times in "
+            "_start_run; a gate's variable must be bound once, before any output "
+            "is read, or a later handler can rebind it out from under the gate"
+        )
+        assert guarded not in params, (
+            f"{guarded!r} is the parameter itself -- use a local captured at entry, "
+            "so a handler that rebinds the parameter cannot reach the gate"
+        )
 
 
 def test_the_stamp_gate_and_the_sync_label_are_one_constant():

@@ -665,6 +665,228 @@ the pinned `/assets` route and the staged `index.html` on the same hashed
 chunks. The run script stops at the first non-zero step, so a build or staging
 failure fails the sync rather than silently leaving the symlink in place.
 
+### Backend-only sync: skipping the frontend build at runtime
+
+A sync that lands a `website/` tree already built and served pays the frontend
+build's whole cost to reproduce a bundle on disk. That step is still
+**assembled**; it carries a `skip_if_frontend_unchanged` marker on its wrapped
+step dict (beside `stash`), and the generated runner decides.
+`frontend_skip.may_skip_frontend` is the decision, in its own stdlib-only module
+executed from a by-path snapshot exactly like `npm_preflight` — the runner must
+not import `kiro_crew` — whose bytes are checked against a digest baked into the
+runner's script before they run. The marker is attached only when the backend
+already holds a record for that checkout; the runner only **decides**, and never
+records.
+
+**`npm ci` is not a skip candidate and stays unconditional.** Whether the
+on-disk `node_modules` is the tree `npm ci` would produce cannot be verified
+below the cost of running it. The hidden `.package-lock.json` npm writes inside
+`node_modules` is metadata it writes once and nothing reconciles with the files it describes: it
+stays byte-identical while a package is deleted from the tree, while a file
+inside an installed package is removed, and while one is truncated. npm's
+`integrity` hashes are over the published *tarball*, not the extracted tree, so
+nothing on disk lets them be re-derived, and `.bin` symlinks and `postinstall`
+artifacts are outside the lockfile's description entirely. `npm ci` is also the
+step that **repairs** such a tree, and it is the cheap half of the frontend
+work, so leaving it unconditional costs little and makes the build's dependency
+input correct by construction.
+
+**The runner interpreter carries `-I`**, for the same reason the preflight
+snapshot step does. This by-path load is the one import the runner performs *after*
+its merge step, and the snapshot's own imports resolve through `sys.path` like any
+other import — neither the mkdtemp the snapshot sits in nor the digest check on its
+bytes covers what those bytes then import. Plain `python -c` puts the inherited cwd at `sys.path[0]` ahead of the
+stdlib, and that cwd is the gateway's own source root, which on the editable
+install Dev Fleet manages *is* the tree being synced; the runner process is also
+the one thing here that is **not** sandbox-wrapped, since only the step argvs go
+through `sandboxed_spawn_argv`. Without `-I`, a file named `hashlib.py` that the
+incoming revision plants at that source root executes in the runner, outside the
+per-step sandbox.
+
+The decision is **deferred into the runner** because it needs `HEAD`'s `website/`
+tree OID, and `HEAD` does not name the revision being landed until the run's own
+`merge --ff-only` step has moved it.
+
+#### It fires on a provenance record, not on a comparison of artifacts
+
+The property a safe skip needs — "the served bundle was produced by a completed
+build from exactly the source on disk now" — is a statement about **history**, and
+no comparison of two artifacts can establish it, because the decisive failure
+leaves the artifacts equal. `npm run build` is `tsc -b && vite build` and
+`emptyOutDir` lives *inside* vite, so a TypeScript error in freshly merged code
+means vite never runs and `website/dist` is left fully intact — byte-identical to
+the `static/dist` copy it was staged from. The merge has landed by then, so a
+delta-based gate is empty too, and a retry would skip and report success having
+never built the merged frontend.
+
+So the sync produces the record itself. `frontend_skip.build_record` runs in the
+Dev Fleet backend, from `_start_run`'s completion path, **only for a `sync` run
+that neither timed out nor exited non-zero**, and yields two fields:
+
+- the `website/` tree OID — `git rev-parse HEAD:website`, the source the build read.
+- the staged-dist digest — sha256 over **every entry** under the `static/dist` that
+  build staged: each entry's path within the bundle, its kind (file, directory, or
+  symlink to either), and every byte of every file, plus the entry count. The two
+  fields travel as separate values and are compared separately, so neither can be
+  read as part of the other.
+
+  The serialization is **injective**: each variable-length field carries its own
+  fixed-width big-endian length, so no two distinct trees can produce one digest.
+  A separator cannot give that, because it only delimits values that cannot
+  contain it and a file body is arbitrary bytes — under `path SEP body SEP` a
+  single file whose bytes spell out the framing of two collides with the pair
+  (`{a: X, b: Y}` against `{a: X SEP b SEP Y}`), and here a collision reads as
+  "the recorded build's bundle is still staged" while an asset is gone: the build
+  is skipped and the missing asset 404s under a sync that reported success. What
+  is framed is what a static file server serves; metadata that cannot change a
+  served byte (mode, mtime, owner) is deliberately out, so a permission bit does
+  not force a rebuild. Directories are in even though they serve nothing
+  themselves, which is what makes an added, removed or newly-symlinked directory
+  visible — the walk does not descend a link, so an undetected one would hide a
+  whole subtree. Because the record is memory-only, changing what the digest
+  frames costs each checkout one frontend build and nothing more; no stored value
+  of an older framing exists to be misread.
+
+#### The invariant: no input to the verdict is readable from a channel a step can write
+
+**The record is never on disk.** It lives in
+`runtime._FRONTEND_BUILD_RECORDS`, keyed by absolute repo path and bounded by
+`_FRONTEND_BUILD_RECORDS_MAX`, and reaches the runner baked into the runner's own
+script text as two hex values — a channel a sync step can read through
+`/proc/<pid>/cmdline` but cannot modify. Which gives the whole verdict one shape:
+
+| Input | Where it comes from | Why a step cannot steer it |
+|---|---|---|
+| recorded tree OID, recorded dist digest | the backend's heap → the runner's script text | no step writes the backend's memory or the runner's argv |
+| the decision *code* (`frontend_skip`) | a mkdtemp snapshot, verified against a sha256 baked into the same script text | a substituted snapshot fails the check, and the **verified bytes** are what execute — so nothing can be swapped between check and load |
+| `HEAD:website` | recomputed live from git | changing it moves the OID away from the record → build |
+| the staged-dist digest | recomputed live from the filesystem | staging a bundle of its own choosing moves the digest → build |
+| `website/` cleanliness | recomputed live from git | any dirt or untracked file → build |
+
+Everything recomputed live can only make the verdict **more** conservative, so
+tampering costs an attacker a build rather than buying one. The record is the only
+historical *claim* involved, and it is the one thing kept out of reach.
+
+**A durable record cannot have that property, at any price.** Two facts force it,
+and both are the reason the earlier design — a stamp file masked from the steps
+with `extra_hidden_dirs` — protected nothing:
+
+- **An app backend's `extra_hidden_dirs` is silently dropped.** `apps/backend.py`
+  spawns every app backend through `sandbox.wrap_argv`, so the Dev Fleet backend
+  runs inside a Kiro Crew namespace and carries `KIROCREW_SANDBOX_ACTIVE` (which
+  is exactly what `gateway_service.default_confinement` reports as its normal
+  state). `wrap_argv` then takes its **nested passthrough** — a nested re-wrap is
+  denied by design on both platforms — and that branch returns the argv unchanged
+  *before* `extra_hidden_dirs` is consulted. So on every shipped configuration the
+  mask was inert while reading as a control. Pinned in `test_sandbox_argv.py`.
+- **Inside one namespace there is no path the backend can write and its own steps
+  cannot.** Where the host has no sandbox backend at all, or the operator took the
+  `sandbox_allow_unsandboxed_exec` opt-in, the steps run unconfined at the same uid
+  and the conclusion holds for the simpler reason. Signing the record does not
+  rescue a file either: a key on disk is readable at the same uid, and a key in
+  memory dies with the backend — which is the very durability a file was for.
+
+**What this costs, and what it buys.** The cost is durability across a backend
+restart: the first backend-only sync of a checkout in each Dev Fleet backend
+lifetime pays the full frontend build, and every later one skips. The gain is that
+the skip no longer depends on confinement it cannot get, so it is equally sound —
+and equally available — on a host with no sandbox backend and on Windows, neither
+of which a mask could ever have covered. It also bounds a writer no mask ever
+covered: an actor working in the checkout *between* two syncs could forge a stamp
+and steer the next sync, because `extra_hidden_dirs` only ever applied to the
+sync's own steps. Against a record in the backend's heap, such an actor can only
+cost an unnecessary build.
+
+The record is **replaced, including with nothing**: a run that succeeded while
+leaving `website/` dirty or `static/dist` unreadable drops the older pair rather
+than letting it stand as if it described the bundle now on disk. A failed
+derivation is logged and drops it too — the run has already succeeded, and a
+missed refresh only costs the next sync a build.
+
+#### The four conditions
+
+1. `HEAD`'s `website/` tree OID is obtainable (`git rev-parse HEAD:website`). A
+   **tree OID is an identity, not a delta**: two revisions share it exactly when
+   their `website/` trees are equal all the way down, so the decision needs no
+   second revision — and a diff would need one, which inside a runner that has
+   already fast-forwarded can only be `HEAD` itself, making it vacuously empty on
+   every successful sync. The revision asked about is `HEAD` and **never the
+   incoming ref**, because `merge --ff-only <ref>` also exits zero — printing
+   "Already up to date" — whenever the ref is an *ancestor* of HEAD, which is what
+   a checkout carrying local commits looks like: the ref's `website/` tree is then
+   still the recorded one while HEAD's has moved, so asking about the ref would
+   skip over a committed frontend change, report success, and repeat on every
+   later sync. Asking about `HEAD` cannot fail that way — after a successful
+   `merge --ff-only` HEAD is either the ref (the same answer) or ahead of it
+   (correctly refused) — and it is the same revision `build_record` describes,
+   so the check and the record are symmetric. Because
+   `package-lock.json` lives inside `website/`, the same OID pins the declared
+   dependency set too.
+2. The record from a **completed** earlier build names that same tree OID. It is
+   passed as two values; `may_skip_frontend` has no parameter that could name a
+   file, which is what keeps a planted record out of the verdict.
+3. The staged tree still hashes to the record's dist digest. One ordered walk
+   covers both presence (no `index.html`, or anything unreadable, must rebuild —
+   running the build+stage step is what repairs it) and identity, so a restage by
+   one of `_stage_dist`'s other callers is **detected** rather than silently
+   inherited. It hashes the whole tree rather than `index.html` alone because the
+   marker file cannot see a bundle that lost its chunks: `emptyOutDir` deletes the
+   previous bundle in directory order before writing the new one, so a build+stage
+   step killed mid-empty (the run watchdog's timeout kill, or gateway shutdown
+   reaping the tree) can leave `index.html` byte-identical to the recorded one
+   with the chunks it references already gone — and that step exits non-zero, so
+   the *old* record stands and a backend-only retry passes conditions 1, 2 and 4.
+   An index-only digest would skip there and serve a shell whose every asset
+   404s. The same walk covers the public assets vite copies verbatim under stable
+   unhashed names (`/vendor/*.mjs`, icons, `sw.js`), which no digest of
+   `index.html` describes.
+4. `git status --porcelain --untracked-files=all -- website` is empty. A tree OID
+   describes a *commit*, while the build reads the *working tree*, and `merge
+   --ff-only` succeeds over a dirty `website/` it does not touch — so without this
+   an uncommitted `website/src` edit, or an untracked new component, is never built
+   while the sync reports success. It does not make the skip unreachable:
+   `website/.gitignore` already covers `node_modules` and `dist`, so a fully built
+   checkout still reads clean.
+
+Skipping is conservative everywhere else — a `website/` change (a different tree
+OID), **no record at all** (a cold backend, or a checkout this backend has never
+synced: the step is simply left untagged and the build runs), a failed or
+interrupted earlier build (which produced none), an out-of-band restage, a staged
+tree damaged since the record, a dirty `website/`, an absent or unreadable
+`static/dist`, git unavailable, a helper snapshot that could not be staged (a full
+`TMPDIR` logs and leaves the step untagged), and a snapshot that fails its digest
+check all mean "build, as before". A failure to *derive* the record is equally
+harmless and never fails a sync that already succeeded: it costs the next sync a
+rebuild. On an edition checkout the build step does not exist, so nothing carries
+the marker, and that run is not handed a `frontend_record_repo` either — it
+establishes nothing about the served bundle, so it must not vouch for it.
+
+#### Accepted residuals
+
+The first two follow from the build not being a pure function of `website/`, and
+neither can serve stale application code — which is why the record captures
+provenance instead of asserting byte-equality (a byte-equality record would never
+match, and the skip would silently never fire):
+
+- `website/vite.config.ts` stamps `git rev-parse --short HEAD` into the built
+  service worker, so after a backend-only sync a rebuild would emit a different service-worker
+  version string than the staged one. The service worker is network-first and
+  caches only the offline shell.
+- A Node or npm upgrade between the recorded build and the skip can change the
+  emitted bundle with an unchanged `website/` tree.
+
+The third is a race rather than an impurity: `build_record` fingerprints
+`static/dist` *after* the build+stage step has exited, so after
+`frontend.build_and_stage` released the staging lock. A peer `_stage_dist` caller
+(the dashboard's own update, pod provisioning) that restages inside that window
+makes the record pair this sync's `website/` tree OID with a bundle it did not
+produce, and a later sync landing the same tree honours it. The window is
+sub-second, and the record still cannot name code older than the tree it records.
+Closing it would mean holding `frontend._staging_lock` across the derivation, which
+blocks a shared executor thread for the length of a peer's whole build — a worse
+trade than the residual, since the peer that restaged has already changed what is
+served whether or not this record notices.
+
 ### Dependency preflight and the `node_modules` transaction
 
 `npm ci` deletes `node_modules` before it installs, so a registry refusal used to

@@ -1760,7 +1760,12 @@ async def _sync_start_locked() -> dict:
         )
     else:
         raw_steps += [
-            ([npm_bin, "ci", "--prefix", "website"], "strict", runtime._build_env(), "npm ci"),
+            (
+                [npm_bin, "ci", "--prefix", "website"],
+                "strict",
+                runtime._build_env(),
+                runtime._NPM_CI_LABEL,
+            ),
             # Build and stage as ONE step, holding the staging lock across both.
             # `npm run build` empties website/dist, so a peer flow (the
             # dashboard's own update, pod provisioning) staging concurrently
@@ -1787,15 +1792,167 @@ async def _sync_start_locked() -> dict:
                 ],
                 "strict",
                 runtime._build_env(),
-                "npm build + stage",
+                runtime._BUILD_STAGE_LABEL,
             ),
         ]
+    # A backend-only sync -- one that lands the same website/ tree that is already
+    # built and served -- pays the frontend BUILD's whole cost to reproduce a
+    # bundle already on disk. That one step is elided on a runtime verdict, which
+    # is where the cost is repaid.
+    #
+    # `npm ci` is NOT part of it and stays unconditional. Whether the on-disk
+    # node_modules is the tree `npm ci` would produce cannot be verified below
+    # the cost of running it: npm's node_modules/.package-lock.json is metadata
+    # it writes once and nothing reconciles with the files it describes, so it
+    # stays byte-identical while a package is deleted from the tree or a file
+    # inside one is truncated, and npm's `integrity` hashes are over the
+    # published tarball rather than the extracted tree. `npm ci` is also the step
+    # that REPAIRS such a tree, and it is the cheap half of the frontend work.
+    #
+    # The decision is made at RUNTIME, inside the generated runner, not here: it
+    # needs HEAD's website/ tree OID, and HEAD does not name the revision this
+    # sync lands until the `merge --ff-only` step -- which runs inside the
+    # runner's own loop -- has moved it, while the step list is assembled before
+    # any step runs. So the step is still ASSEMBLED (the runner decides whether to
+    # run or skip it) and TAGGED with a marker, mirroring how the npm ci step is
+    # tagged with `stash` and the runner acts on it in its loop.
+    #
+    # WHAT MAKES THE SKIP SAFE IS A PROVENANCE RECORD, NOT A COMPARISON. The
+    # record -- the website/ tree OID plus the staged bundle's fingerprint -- is
+    # derived only after a sync run has EXITED ZERO, and the skip fires only when a
+    # record names the very tree this sync is landing. Nothing here compares two
+    # artifacts, because the artifacts are equal in exactly the case that matters:
+    # `npm run build` is `tsc -b && vite build` and emptyOutDir lives inside vite,
+    # so a TypeScript error in freshly merged code means vite never runs and
+    # website/dist is left byte-identical to the copy already staged. A build that
+    # failed simply never reaches the record, so the record keeps naming the older
+    # tree and the retry rebuilds.
+    #
+    # THE RECORD IS NEVER ON DISK, AND NOTHING THE VERDICT READS COMES FROM A
+    # CHANNEL A SYNC STEP CAN WRITE. That is the whole invariant, and it is what
+    # makes the skip safe on every host rather than only on some:
+    #
+    #   * the historical CLAIM (the recorded tree OID and dist digest) lives in the
+    #     deciding processes only -- this backend's own `_FRONTEND_BUILD_RECORDS`,
+    #     and from there baked into the runner's own script text below;
+    #   * the decision CODE arrives the same way: the snapshot is verified against a
+    #     digest baked into that script text before the runner executes it;
+    #   * everything else the verdict reads -- HEAD:website, the staged-dist digest,
+    #     website/ cleanliness -- is recomputed LIVE from git and the filesystem at
+    #     decision time, and tampering with those can only withhold the skip. A step
+    #     that stages a bundle of its own choosing changes the live digest, so the
+    #     record stops matching and the build RUNS.
+    #
+    # A file cannot have that property, at any price, and the reason is structural
+    # rather than a matter of picking a better directory. On every shipped
+    # configuration this backend is itself spawned through sandbox.wrap_argv (see
+    # apps/backend.py), so it already carries KIROCREW_SANDBOX_ACTIVE -- and
+    # wrap_argv then takes its NESTED PASSTHROUGH, which returns before
+    # extra_hidden_dirs is consulted and hands the step its argv unchanged. So the
+    # backend and its own steps share one mount namespace, in which no path is
+    # writable by the one and not the other; masking the record from the steps is
+    # not an option this caller has. Where there is no sandbox backend at all, or
+    # the operator took the unsandboxed opt-in, the steps run unconfined at our uid
+    # and the same conclusion holds for a different reason. Signing the record does
+    # not rescue a file either: a key on disk is readable at the same uid, and a key
+    # in memory dies with the backend, which is the very durability a file was for.
+    #
+    # What this gives up is durability across a backend restart: the first
+    # backend-only sync of a checkout in each backend lifetime pays the full
+    # frontend build, and every later one skips. What it buys is that the skip no
+    # longer depends on confinement it cannot get, so it is equally sound on a host
+    # with no sandbox backend and on Windows.
+    #
+    # It also bounds a writer the mask never covered: an actor working in the
+    # checkout BETWEEN two syncs could forge a record on disk and steer the next
+    # sync, because a mask only ever covered the sync's own steps. A record in this
+    # process's heap has no such writer -- at worst a tamperer costs an
+    # unnecessary build.
+    #
+    # EDITION path is unaffected: on an edition checkout frontend_half is false,
+    # so the build step is not in the list and nothing carries the marker -- the
+    # runtime skip is a guarded no-op there (a step without the marker key is
+    # never a skip candidate). The block below only runs when the step is present.
+    frontend_skip_cleanup: list[str] = []
+    # Bound BEFORE the staging attempt, so every path out of it reaches the
+    # tagging loop below with a defined marker: the OSError branch deliberately
+    # only logs, and leaving the name unbound there would make the read in that
+    # loop raise UnboundLocalError and abort the whole Pull+Build -- the opposite
+    # of the degradation the handler exists to provide.
+    _frontend_skip_marker: dict | None = None
+    # None on the edition path (no frontend build step to skip) or a frozen
+    # install (nothing readable to snapshot) -- both mean no marker, so the
+    # runner builds as it does today.
+    skip_source = runtime._FRONTEND_SKIP_SOURCE if frontend_half else None
+    # The record this backend holds for THIS checkout, or None when it holds none:
+    # a cold backend, a checkout never synced by it, or a previous sync that could
+    # not honestly vouch for the bundle. No record means no marker means the build
+    # runs, which is the honest cold-start path rather than a degradation.
+    skip_record = runtime._FRONTEND_BUILD_RECORDS.get(str(repo))
+    if skip_source is not None and skip_record is not None and runtime._FRONTEND_SKIP_DIGEST:
+        # Snapshotted by path from the bytes captured at import, exactly like the
+        # preflight and dep_sync snapshots: the runner is stdlib-only and must
+        # not import kiro_crew, and executing the module from the checkout would
+        # run whatever the sync is about to merge. mkdtemp (unguessable, 0o700)
+        # so no other local user can substitute the snapshot between staging and
+        # the runner's load. What the snapshot ITSELF imports is a separate
+        # question the mkdtemp does not answer -- `exec_module` resolves those
+        # through sys.path, not beside the file -- and the runner's `-I` is what
+        # keeps the merged checkout off that path. A same-uid sync step can still
+        # reach the file (/tmp is listable), which is why the runner verifies it
+        # against the digest baked into the script rather than trusting the path.
+        skip_dir: Path | None = None
+        try:
+            skip_dir = Path(tempfile.mkdtemp(prefix="kirocrew-frontend-skip-"))
+            skip_snap = skip_dir / "frontend_skip.py"
+            skip_snap.write_bytes(skip_source)
+        except OSError as exc:
+            # mkdtemp can succeed and the WRITE still fail, and nothing has been
+            # registered for the run's cleanup yet at this point -- so remove the
+            # directory here, the same way the preflight snapshot above does, or
+            # an ENOSPC TMPDIR leaks one empty directory per sync.
+            if skip_dir is not None:
+                shutil.rmtree(skip_dir, ignore_errors=True)
+            # A full/unwritable TMPDIR must not turn a Pull+Build into a refusal:
+            # the skip is a pure optimization, so on any staging failure we simply
+            # do NOT tag the step and the sync builds as it does today. Log and
+            # carry on rather than propagate.
+            runtime.logger.info(
+                "dev-fleet: could not stage the frontend-skip helper (%s); the "
+                "backend-only frontend skip is disabled for this run and the "
+                "frontend build will run",
+                exc,
+            )
+        else:
+            frontend_skip_cleanup = [str(skip_snap), str(skip_dir)]
+            # The marker carries the snapshot path and its expected digest, the git
+            # binary and repo, and the recorded pair ITSELF -- as two hex values, so
+            # the runner never reads a record off disk and there is no path it could
+            # read one from. It carries no revision: the check asks about HEAD,
+            # which after the merge step IS the source the build reads. It is
+            # attached to the build+stage step below (on the wrapped step DICT,
+            # beside `stash`, the same place and way the runner already reads
+            # per-step metadata). The runner verifies the snapshot, loads it, and
+            # calls frontend_skip.may_skip_frontend(git, repo, tree, dist).
+            _frontend_skip_marker = {
+                "snapshot": str(skip_snap),
+                "digest": runtime._FRONTEND_SKIP_DIGEST,
+                "git": git_bin,
+                "repo": str(repo),
+                "tree": skip_record[0],
+                "dist": skip_record[1],
+            }
     cleanups: list[str] = []
     # The preflight's snapshot is removed with the run's other temporaries. It is
     # registered here rather than left behind: a leaked mkdtemp per sync is how
     # the dependency-only path already accumulates one, and repeating that would
     # litter the operator's temp directory on every Pull + Build.
     cleanups.extend(preflight_cleanup)
+    # The frontend-skip snapshot rides the same cleanup as every other temporary
+    # (file before directory), so a leaked mkdtemp does not litter the operator's
+    # temp directory on every Pull + Build. Empty on the edition path / when the
+    # snapshot could not be staged.
+    cleanups.extend(frontend_skip_cleanup)
     if dep_sync_snapshot is not None:
         # File first, then its directory: the cleanup loop removes entries in
         # order, and a directory cannot go until it is empty.
@@ -1810,7 +1967,17 @@ async def _sync_start_locked() -> dict:
             cleanups.append(cleanup)
         wrapped_steps.append({"argv": w_argv, "env": w_env, "label": label})
     for step in wrapped_steps:
-        if step["label"] == "npm ci":
+        # Tag the build+stage step -- and ONLY it -- with the runtime skip
+        # marker. `npm ci` is deliberately not a skip candidate (see above: its
+        # tree cannot be verified below the cost of running it), so it never
+        # carries the key. The marker is None on the edition path (the step is
+        # not even present) and when the helper snapshot could not be staged, so
+        # this is a guarded no-op in both cases. It is attached on the wrapped
+        # DICT beside `stash`, the same per-step channel the runner already
+        # consults in its loop.
+        if _frontend_skip_marker is not None and step["label"] == runtime._BUILD_STAGE_LABEL:
+            step[runtime._SKIP_MARKER] = _frontend_skip_marker
+        if step["label"] == runtime._NPM_CI_LABEL:
             # `npm ci` deletes node_modules BEFORE it installs, and a tree it
             # emptied is the one artifact of a failed sync that cannot be
             # rebuilt without the registry — which is exactly what is unavailable
@@ -1850,6 +2017,73 @@ async def _sync_start_locked() -> dict:
         "    env = dict(st['env'])\n"
         "    env['PYTHONIOENCODING'] = 'utf-8:replace'\n"
         "    return subprocess.run(st['argv'], cwd=cwd, env=env).returncode\n"
+        # Runtime skip decision for a backend-only sync. The build+stage step is
+        # tagged (up front, in _sync_start_locked) with a
+        # 'skip_if_frontend_unchanged' marker carrying the git binary, the repo, the
+        # verified helper snapshot, and THE RECORDED PAIR ITSELF as two hex values.
+        # The decision cannot be made at assembly time because it needs HEAD's
+        # website/ tree OID, and HEAD does not name the revision being landed until
+        # the `merge --ff-only` step -- which runs inside THIS loop -- has moved it.
+        # So the runner asks the question here, where HEAD is already the source the
+        # build would read.
+        #
+        # The runner only DECIDES; it never records. The record is derived by the
+        # Dev Fleet backend after this whole run exits zero, and reaches this
+        # program only inside its own script text. Nothing the verdict reads comes
+        # from a channel a step of this sync can write: the recorded pair and the
+        # helper's expected digest are baked in here (a step can read our argv, but
+        # not change it), and HEAD:website, the staged-dist digest and website/
+        # cleanliness are recomputed live -- where tampering can only WITHHOLD the
+        # skip, since a bundle a step staged itself no longer matches the record.
+        #
+        # The skip fires on a PROVENANCE RECORD, never on a comparison of
+        # artifacts: the record is derived only after a run exited zero, so a failed
+        # build (including the `tsc -b` failure that leaves website/dist
+        # byte-identical to the staged copy, which no artifact comparison can
+        # distinguish from a good build) never produces one, and the retry rebuilds.
+        #
+        # The decision logic lives in a stdlib-only helper (frontend_skip.py),
+        # snapshotted by path exactly like the preflight/dep_sync snapshots,
+        # because THIS script must not import kiro_crew (that pulls the package
+        # __init__ chain). Its BYTES are checked against the baked digest before
+        # they are executed: the snapshot's mkdtemp is 0o700, which stops another
+        # local user, but a lifecycle script running at OUR uid can list /tmp and
+        # overwrite the helper with one that always returns True. The decision code
+        # is an input to the verdict exactly as the record is, so it arrives over
+        # the same trusted channel. Compiled from the verified bytes rather than
+        # re-read by the loader, so nothing can be swapped between check and load.
+        # Any failure to verify, load or evaluate -> do NOT skip: the skip is a pure
+        # optimization and building is always correct.
+        #
+        # This is the ONE load in this program that happens after a step has
+        # merged content from the incoming revision, and the snapshot's own
+        # top-level imports resolve through sys.path like any other import -- so
+        # it depends on the interpreter running under `-I`, which takes the
+        # working directory off that path (see the argv below). Without it,
+        # `src/hashlib.py` in the merged revision executes here, in a process the
+        # per-step sandbox does not cover.
+        "import hashlib as _hl\n"
+        "_skip_mods = {}\n"
+        "def _skip_helper(marker):\n"
+        "    path = marker['snapshot']\n"
+        "    if path not in _skip_mods:\n"
+        "        with open(path, 'rb') as fh:\n"
+        "            data = fh.read()\n"
+        "        if _hl.sha256(data).hexdigest() != marker['digest']:\n"
+        "            raise ValueError('the frontend-skip helper snapshot was '\n"
+        "                             'modified since it was staged')\n"
+        "        ns = {'__name__': 'frontend_skip', '__file__': path}\n"
+        "        exec(compile(data, path, 'exec'), ns)\n"
+        "        _skip_mods[path] = ns\n"
+        "    return _skip_mods[path]\n"
+        "def may_skip_frontend(marker):\n"
+        "    try:\n"
+        "        return bool(_skip_helper(marker)['may_skip_frontend'](\n"
+        "            marker['git'], marker['repo'], marker['tree'], marker['dist']))\n"
+        "    except Exception as exc:\n"
+        "        print('frontend-skip check failed (%s); running the frontend '\n"
+        "              'build' % exc, flush=True)\n"
+        "        return False\n"
         # `rmtree(..., ignore_errors=True)` alone is not safe HERE, even though
         # it is the right default elsewhere: every deletion below decides what
         # the next rename does, so a partial removal that is silently ignored
@@ -1922,8 +2156,24 @@ async def _sync_start_locked() -> dict:
         "        print('restoring a dependency tree left stashed by an earlier '\n"
         "              'run', flush=True)\n"
         "        os.rename(backup, stash)\n"
+        # The step-dict key the frontend-skip marker lives under. Inlined as a
+        # literal for the same reason RESERVED/PREFLIGHT are: the script is
+        # stdlib-only and cannot import the constant from the package.
+        f"SKIP_MARKER = {json.dumps(runtime._SKIP_MARKER)}\n"
         "for i, st in enumerate(steps):\n"
         "    print(f'::step::{i}::{st[\"label\"]}', flush=True)\n"
+        # Backend-only skip: if this step carries the frontend-skip marker and a
+        # stamp from a COMPLETED earlier build names the very website/ tree this
+        # sync is landing (with that build's bundle still staged and website/
+        # clean on disk), skip it. Only the build+stage step is ever tagged; the
+        # edition path never reaches here with a marker at all, so this is a
+        # no-op there.
+        "    marker = st.get(SKIP_MARKER)\n"
+        "    if marker and may_skip_frontend(marker):\n"
+        "        print('skipping %s: the staged bundle was built by a completed '\n"
+        "              'earlier build from the same website/ tree this sync '\n"
+        "              'lands, and website/ is clean' % st['label'], flush=True)\n"
+        "        continue\n"
         # node_modules transaction. `npm ci` empties the directory before it
         # installs, so it is moved aside first: on success the backup is
         # dropped, and on ANY non-zero outcome (including the step raising) it
@@ -1987,9 +2237,37 @@ async def _sync_start_locked() -> dict:
         "    if rc != 0:\n"
         "        sys.exit(rc)\n"
     )
-    cmd = [sys.executable, "-c", script]
+    # `-I`, for the same reason the npm_preflight snapshot step above carries it:
+    # it takes the WORKING DIRECTORY off this program's sys.path.
+    #
+    # `python -c` otherwise puts the inherited cwd at sys.path[0], AHEAD of the
+    # standard library, and the cwd this run inherits is inside the checkout the
+    # sync merges into -- a module-style builtin's backend runs with cwd at the
+    # gateway's own source root, which on the editable install Dev Fleet exists to
+    # manage IS the tree being synced. Every import the runner performs AFTER the
+    # `merge --ff-only` step would then resolve against the revision just landed,
+    # in a process the per-step sandbox does not cover: only the step argvs go
+    # through `sandboxed_spawn_argv`, never this one. A `src/hashlib.py` in the
+    # incoming revision would run arbitrary code here the moment the
+    # frontend-skip snapshot's own `import hashlib` ran, and verifying that
+    # snapshot's bytes does not help -- an import inside it resolves through
+    # sys.path, not beside the file.
+    #
+    # Set on the interpreter rather than scrubbed inside the script so it covers
+    # the process for its whole life, including any import the runner grows later
+    # after a step that has already merged untrusted content. Free of cost: this
+    # program is stdlib-only by design, and `-E`/`-s` (which `-I` implies) remove
+    # env and user-site import sources it never uses either.
+    cmd = [sys.executable, "-I", "-c", script]
     rid = await runtime._start_run(
-        runtime._SYNC_RUN_LABEL, cmd, env=runtime._build_env(), cleanup_paths=cleanups
+        runtime._SYNC_RUN_LABEL,
+        cmd,
+        env=runtime._build_env(),
+        cleanup_paths=cleanups,
+        # Only when this run actually owns the frontend half. On an edition checkout
+        # the build+stage step is not in the list at all, so this run establishes
+        # nothing about the served bundle and must not vouch for it.
+        frontend_record_repo=str(repo) if frontend_half else None,
     )
     _SYNC_RID = rid
     return {"ok": True, "run_id": rid}
