@@ -4366,7 +4366,19 @@
       "script_source": "Script source",
       "script_source_download": "Download script",
       "script_source_failed": "Could not load the script source.",
-      "script_source_truncated": "Truncated — the script is larger than the preview limit."
+      "script_source_truncated": "Truncated — the script is larger than the preview limit.",
+      "secrets_active_help": "Injected into this job's environment at run time. Names only — values stay in the vault.",
+      "secrets_add": "Add",
+      "secrets_approve": "Approve",
+      "secrets_deny": "Deny",
+      "secrets_env_placeholder": "ENV_VAR_NAME",
+      "secrets_none": "No secrets granted.",
+      "secrets_pending_help": "Approving injects these vault values into this job's environment at run time. The approval is pinned to the job's current code — if the script or command changes later, injection stops until you approve again.",
+      "secrets_pending_title": "Agent requested secrets",
+      "secrets_pick_secret": "Choose a vault secret…",
+      "secrets_remove": "Remove grant",
+      "secrets_save": "Save grants",
+      "secrets_section": "Vault secrets"
     },
     "servicesTab": {
       "channels": "Channels",

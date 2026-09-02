@@ -257,6 +257,98 @@ Deterministic cron jobs that bypass the LLM entirely:
 - **Safety**: scripts must live under `~/.kiro/crew/crons/`. `is_sensitive_path()` blocks credential file access. SEL audit on every invocation. Auto-pause after 5 consecutive failures (`_AUTO_PAUSE_THRESHOLD`, single-sourced in `CronJob.record_failure`/`record_success`). The auto-pause is **persistent**: an execution-owned `auto_paused` flag (distinct from `user_paused`) is written by `_save`, propagated by `_merge_job_result`, and folded into the effective `enabled` derivation in `_load` — so a failing job stays paused across a daemon restart; `enable_job(True)` or a later success clears it (SEL-audited transitions). Concurrent execution guard prevents double-fire.
 - **Kind tag**: `cron_list` labels each job as `script`, `command`, or `agent` based on which mode is configured.
 
+#### Operator-Granted Vault Secrets (`secret_env` / `secret_env_pin`)
+
+Script/command crons can receive secrets from the encrypted `SecretVault`
+(`kiro_crew.secrets`) without a plaintext token ever living in `.env`, the cron
+store, or the script. A grant is a per-job map `secret_env: {ENV_NAME:
+vault-secret-name}` plus a code pin, persisted on the job and resolved only at
+fire time:
+
+- **Grant surface is operator-only, but requests are agent-first.** The MCP
+  tool `cron_secret_request` (job ownership enforced) lets the agent record a
+  PENDING request — mapping + a pin of the code at request time, written to the
+  separate `secret_env_pending*` fields, never the active pair — after which
+  the operator approves or denies. `PUT /api/crons/{id}/secrets` accepts
+  `{"approve_pending": true}` (routes through `_promote_pending_grant`, which
+  re-verifies the pending pin against the job's CURRENT code and refuses 409
+  `code_changed` on drift, so an approval never blesses code that changed
+  after the request), `{"deny_pending": true}`, a direct grant
+  `{"secret_env": {...}}`, or a revoke (empty map). **The machine/human
+  boundary is enforced IN the handlers**, because `/api/crons` is a prefix
+  entry in the mixed internal paths: the grant route refuses a proven
+  `X-Internal-Secret` caller (`request["internal_auth"]`, 403 `operator_only`)
+  — machines request, humans grant — while
+  `POST /api/crons/{id}/secret-request-card` requires that same marker (its
+  only caller is the MCP tool). **Granting is additionally owner-only**: a
+  dashboard token minted for an allowed Slack user (`!dashboard`) clears the
+  machine check but is not the vault's owner, so the grant route also requires
+  `is_owner_dashboard_request` (403 `owner_only` otherwise), and `GET
+  /api/crons` serializes the `secret_env*` metadata fields (names only even
+  for the owner) exclusively into owner-view responses. The persistence layer
+  (`_update_job_locked`)
+  re-validates every grant AND every pending request: env-name grammar
+  (`[A-Z][A-Z0-9_]*`), the protected-name deny set (`_CRON_ENV_DENY`, `PATH`,
+  loader-hijack prefixes `LD_`/`DYLD_`/`PYTHON`, product-internal
+  `KIROCREW*`/`_KIROCREW*`), a 16-entry cap, and script/command jobs only — an
+  `agent` job is refused because its session would hand the plaintext to the
+  model, defeating the vault's agent fence.
+- **Inline approval card.** After recording a pending request, the MCP tool
+  best-effort POSTs `secret-request-card` (via
+  `cron_trigger.post_secret_request_card`, same loopback credential as the
+  cron trigger), which raises the standard `request_approval` card in the
+  requesting session's chat slot (`dashboard_slot_key`) and returns 202
+  immediately; the decision resolves in a background task through
+  `_promote_pending_grant`. The card summary carries env-var names and vault
+  secret NAMES only. A denied or expired card leaves the durable pending
+  record in place (the broker reports timeout and denial identically) —
+  Schedule > job > Secrets remains the authoritative approve/deny/revoke
+  surface, and sessions with no dashboard tab simply skip the card.
+- **The pin binds the grant to the code the operator approved.**
+  `compute_secret_env_pin` produces an **HMAC-SHA256** over the HMAC
+  **domain** (`pending` for an agent request awaiting approval, `active` for
+  an operator-minted grant — a pending pin copied verbatim into the active
+  store fields never verifies), the **job id** (no cross-job replay), the
+  **canonical grant mapping** (re-pointing which secrets flow under an
+  existing pin breaks it), and the job's code — for scripts, the spec + the
+  job `message` (the script's agent-updatable *arguments*, so re-aiming an
+  approved script requires re-approval) + current body bytes; for commands,
+  the command text. It is keyed by a purpose-scoped derivation
+  (`SecretVault.derive_subkey("cron-grant-pin")`) of the existing vault key —
+  a vault-fenced secret the agent's tools cannot read and sandboxed cron
+  children never see — so a forged cron store entry cannot carry a pin the
+  runner accepts, even on hosts whose OS sandbox backend degrades to "none".
+  Deriving reuses the vault key's exclusive-create birth, fsync durability
+  and owner-only ACL instead of introducing a second key file with its own
+  birth race and corruption modes; a vault store whose key is missing fails
+  every grant path closed. The grant endpoint computes pins server-side and
+  ignores any client value. Scripts under `crons/` stay agent-writeable by
+  design, so at fire time `run_script_sandboxed` reads the body ONCE,
+  re-verifies the pin (constant-time compare), and executes those verified
+  bytes from a **private temp dir that is also what goes on `sys.path`** —
+  the launcher never re-reads the on-disk file and a granted script cannot
+  `import` an unpinned sibling module from the live `crons/` dir (the import
+  fails instead of running with the secrets; ungranted scripts keep sibling
+  imports). A pin mismatch fails the run closed with a re-approve message;
+  the command runner does the same over the command text.
+- **A decision acts on exactly the request the human saw.** The agent can
+  replace a pending request at any moment, so approve and deny both restate
+  the displayed mapping (`expected_secret_env`, plus the request timestamp on
+  approve), and the final swap runs as a **compare-and-swap inside the cron
+  store lock** (`expect_secret_env_pending*` → `CronPendingMismatch` → HTTP
+  409 `stale_request`): a request replaced after render is neither promoted
+  nor silently discarded. The inline card binds its decision to the snapshot
+  it rendered the same way.
+- **Resolution is in-memory only and fail-closed.** The pool worker resolves
+  vault names via `SecretVault.get_many` immediately before spawn and injects
+  them into the child env after the `_clean_cron_env()` scrub but before the
+  product-internal keys (`_KIROCREW_SECRET_FILE`, `_KIROCREW_DIAL_PORT`), which
+  therefore always win. A missing vault entry aborts the run; error messages
+  name the env-var KEY only (the CWE-117 no-echo discipline of
+  `mcp_gateway/secret_uri.py`). `GET /api/crons` exposes grant NAMES for the
+  UI; plaintext never leaves the vault. Grants and revokes are SEL-audited
+  (`cron.secret_grant` / `cron.secret_revoke`, names only).
+
 #### Auto-pause applies to `agent` (message) crons too
 
 Auto-pause is not script/command-only. An `agent` cron's turn signals failure

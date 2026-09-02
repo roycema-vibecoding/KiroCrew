@@ -78,6 +78,12 @@ _CRON_STRING_FIELD_CAPS: tuple[tuple[str, int], ...] = (
     ("command", 5000),
     ("script", 200),
     ("timezone", 50),
+    # Secret-grant fields have no boundary FieldSpec: the pins are sha256 hex
+    # digests computed server-side by the grant endpoint / cron_secret_request
+    # tool (grant validity is enforced by pin equality at fire time, not by
+    # this length gate). Per the no-schema convention they use the general ID cap.
+    ("secret_env_pin", MAX_SHORT_STRING),
+    ("secret_env_pending_pin", MAX_SHORT_STRING),
 )
 
 
@@ -430,6 +436,17 @@ _FILE_LOCK_TIMEOUT_SECS = 10.0  # max wall-time to wait for the store lock
 _FILE_LOCK_POLL_SECS = 0.02  # sleep between non-blocking acquire attempts
 
 
+class CronPendingMismatch(RuntimeError):
+    """The job's pending secret request changed after the caller read it.
+
+    Raised inside the locked update when an ``expect_secret_env_pending``
+    precondition does not match the freshly reloaded record — the
+    compare-and-swap that keeps an approval or denial from acting on a request
+    the decider never saw (the agent can replace a pending request at any
+    moment). Callers surface it as HTTP 409 ``stale_request``.
+    """
+
+
 class CronStoreBusy(TimeoutError):
     """Raised when a cron-store mutator cannot acquire the store lock in time.
 
@@ -602,6 +619,26 @@ class CronJob:
     timeout: int = (
         0  # script/command timeout in seconds (0 = use default: 30s script, 300s command)
     )
+    # Operator-granted vault secrets for script/command jobs: env-var name ->
+    # vault secret NAME (kiro_crew.secrets.SecretVault; plaintext never touches
+    # this store). Settable ONLY through the dashboard grant endpoint — the MCP
+    # cron tools never carry the field, so an agent cannot grant itself vault
+    # access. secret_env_pin (sha256 over the script body/command text, see
+    # cron_script.compute_secret_env_pin) binds the grant to the code the
+    # operator approved: the crons/ scripts stay agent-writeable by design, so
+    # a body rewritten after approval fails closed at fire time instead of
+    # running with the secrets.
+    secret_env: dict[str, str] = field(default_factory=dict)
+    secret_env_pin: str = ""
+    # Agent-REQUESTED grant awaiting operator approval. The MCP
+    # ``cron_secret_request`` tool may write ONLY these fields — never the
+    # active pair above — so the agent-first flow is "agent proposes, human
+    # disposes": the dashboard approve endpoint re-verifies the pending pin
+    # against the job's CURRENT code before promoting pending -> active, so an
+    # approval never blesses code that changed after the request.
+    secret_env_pending: dict[str, str] = field(default_factory=dict)
+    secret_env_pending_pin: str = ""
+    secret_env_pending_ts: float = 0.0
 
     def set_run_result(self, value: str) -> None:
         """Record a result produced by the CURRENT run.
@@ -1139,6 +1176,11 @@ def _job_from_record(j: dict[str, Any]) -> CronJob:
         script=j.get("script", ""),
         command=j.get("command", ""),
         timeout=j.get("timeout", 0),
+        secret_env=j.get("secret_env", {}),
+        secret_env_pin=j.get("secret_env_pin", ""),
+        secret_env_pending=j.get("secret_env_pending", {}),
+        secret_env_pending_pin=j.get("secret_env_pending_pin", ""),
+        secret_env_pending_ts=j.get("secret_env_pending_ts", 0.0),
     )
 
 
@@ -2111,11 +2153,20 @@ class CronService:
         :class:`CronStoreBusy` on lock contention and ``ValueError`` on invalid
         input. Safe to run in an executor thread (does no ``_arm_timer``).
         """
+        # Preconditions, not fields: popped before the field gates below ever
+        # see them. When present, the freshly reloaded (locked) record must
+        # still carry exactly the pending request the caller decided on.
+        expect_pending = kwargs.pop("expect_secret_env_pending", None)
+        expect_pending_ts = kwargs.pop("expect_secret_env_pending_ts", None)
         with self._file_lock():
             self._sync_for_write()
             for job in self._jobs:
                 if job.id != job_id:
                     continue
+                if expect_pending is not None and job.secret_env_pending != expect_pending:
+                    raise CronPendingMismatch("pending secret request changed")
+                if expect_pending_ts is not None and job.secret_env_pending_ts != expect_pending_ts:
+                    raise CronPendingMismatch("pending secret request was re-issued")
                 # Validate approval_mode if provided
                 if "approval_mode" in kwargs:
                     valid_approval_modes = ("", "auto")
@@ -2183,6 +2234,47 @@ class CronService:
                         raise ValueError(f"Invalid timeout: {kwargs['timeout']!r}") from e
                     if not 0 <= _tsub <= 86400:
                         raise ValueError(f"timeout must be within 0..86400, got {_tsub}")
+                # Vault secret grant: validated with the other pre-mutation
+                # checks so a rejected grant cannot strand earlier field
+                # mutations. An empty dict revokes (clears the pin too); a
+                # non-empty grant requires a script/command job and the code
+                # pin computed by the grant endpoint. This kwarg is reachable
+                # only from operator surfaces — mcp_cron never passes it.
+                if "secret_env" in kwargs and kwargs["secret_env"] is not None:
+                    _se = kwargs["secret_env"]
+                    if not isinstance(_se, dict) or not all(
+                        isinstance(k, str) and isinstance(v, str) for k, v in _se.items()
+                    ):
+                        raise ValueError("secret_env must be a str->str mapping")
+                    if _se:
+                        cron_script.validate_secret_env_grant(_se)
+                        if not (job.script or job.command):
+                            raise ValueError(
+                                "secret_env grants apply only to script/command jobs "
+                                "(an agent job's session would expose the plaintext "
+                                "to the model, defeating the vault's agent fence)"
+                            )
+                        if not kwargs.get("secret_env_pin"):
+                            raise ValueError("a non-empty secret_env requires secret_env_pin")
+                # Pending grant REQUEST (agent-reachable via the MCP
+                # cron_secret_request tool). Same validation as the active
+                # grant — a request the operator could never approve is
+                # refused at write time, not at approval time. Writing this
+                # field never touches the active pair.
+                if "secret_env_pending" in kwargs and kwargs["secret_env_pending"] is not None:
+                    _sp = kwargs["secret_env_pending"]
+                    if not isinstance(_sp, dict) or not all(
+                        isinstance(k, str) and isinstance(v, str) for k, v in _sp.items()
+                    ):
+                        raise ValueError("secret_env_pending must be a str->str mapping")
+                    if _sp:
+                        cron_script.validate_secret_env_grant(_sp)
+                        if not (job.script or job.command):
+                            raise ValueError("secret grants apply only to script/command jobs")
+                        if not kwargs.get("secret_env_pending_pin"):
+                            raise ValueError(
+                                "a non-empty secret_env_pending requires " "secret_env_pending_pin"
+                            )
                 # Cross-field: the wake budget must cover the subprocess bound
                 # plus cleanup, evaluated on the POST-update effective values —
                 # the wake deadline cancels only the executor future, so a
@@ -2234,6 +2326,23 @@ class CronService:
                     job.folder_id = kwargs["folder_id"] or ""
                 if "model" in kwargs:
                     job.model = str(kwargs["model"] or "").strip()
+                if "secret_env" in kwargs and kwargs["secret_env"] is not None:
+                    job.secret_env = dict(kwargs["secret_env"])
+                    # Pin travels with the grant; a revoke (empty map) clears it.
+                    job.secret_env_pin = (
+                        str(kwargs.get("secret_env_pin") or "") if job.secret_env else ""
+                    )
+                if "secret_env_pending" in kwargs and kwargs["secret_env_pending"] is not None:
+                    job.secret_env_pending = dict(kwargs["secret_env_pending"])
+                    if job.secret_env_pending:
+                        job.secret_env_pending_pin = str(kwargs.get("secret_env_pending_pin") or "")
+                        job.secret_env_pending_ts = float(
+                            kwargs.get("secret_env_pending_ts") or 0.0
+                        )
+                    else:
+                        # Withdraw/deny clears the whole request record.
+                        job.secret_env_pending_pin = ""
+                        job.secret_env_pending_ts = 0.0
                 # Per-wake budget (the asyncio.wait_for deadline in
                 # _execute_with_timeout). Distinct from ``timeout``, which
                 # bounds only script/command subprocesses. Until this branch
@@ -4271,6 +4380,11 @@ class CronService:
                     "script": j.script,
                     "command": j.command,
                     "timeout": j.timeout,
+                    "secret_env": j.secret_env,
+                    "secret_env_pin": j.secret_env_pin,
+                    "secret_env_pending": j.secret_env_pending,
+                    "secret_env_pending_pin": j.secret_env_pending_pin,
+                    "secret_env_pending_ts": j.secret_env_pending_ts,
                 }
                 for j in self._jobs
             ],

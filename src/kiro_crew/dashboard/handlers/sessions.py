@@ -1506,6 +1506,25 @@ async def api_approval_resolve(request: web.Request) -> web.Response:
     action = request.match_info["action"]
     if action not in ("approve", "reject", "reject_once"):
         return web.json_response({"error": "invalid action"}, status=400)
+    if approval_id.startswith("cron-secret:"):
+        # A cron secret-grant card promotes an owner-held vault secret into a
+        # cron subprocess env on approval, so resolving it is owner-only — a
+        # non-owner allowed-user dashboard token (a `!dashboard` session) can
+        # resolve ordinary tool approvals for its own work, but must not be
+        # able to answer this card. Mirrors the owner gate on
+        # PUT /api/crons/{id}/secrets; this endpoint is the card's only
+        # resolve surface (the Slack approval mirror exists solely for
+        # chat-turn tool approvals posted by chat_runner, which this card
+        # never routes through).
+        from kiro_crew.dashboard.handlers._shared import _owner_denial_response
+        from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+
+        if not is_owner_dashboard_request(request):
+            return _owner_denial_response(
+                request,
+                error_message="cron secret grants require the dashboard owner",
+                error_code="owner_only",
+            )
     ok = state.resolve_approval(
         approval_id, action == "approve", rejected_once=action == "reject_once"
     )

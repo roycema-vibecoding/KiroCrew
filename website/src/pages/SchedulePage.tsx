@@ -2,13 +2,14 @@ import { safeSetItem } from '../utils/safeStorage'
 import { useState, useEffect, useCallback, useRef, useMemo, Fragment } from 'react'
 import { useImeGuard } from '../hooks/useImeGuard'
 import Clickable from '../components/Clickable'
-import { List, CalendarDays, CalendarClock, Plus, ClipboardList, ChevronRight, Globe, History, Trash2, FolderPlus, MoreHorizontal, Pencil, Folder, LayoutGrid, GitPullRequestArrow, Download } from 'lucide-react'
+import { List, CalendarDays, CalendarClock, Plus, ClipboardList, ChevronRight, Globe, History, Trash2, FolderPlus, MoreHorizontal, Pencil, Folder, LayoutGrid, GitPullRequestArrow, Download, KeyRound } from 'lucide-react'
 import { api } from '../api/client'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useArmedDelete } from '../hooks/useArmedDelete'
 import { PageHeader, Card, Btn, SendBtn, Badge, SearchInput, EmptyState, FilteredEmpty, Skeleton, Input } from '../components/ui'
 import { CodeBlock } from '../components/CodeBlock'
 import SegmentedControl from '../components/SegmentedControl'
+import SimpleSelect from '../components/SimpleSelect'
 import WeekGrid from '../components/WeekGrid'
 import TimezoneSelect from '../components/TimezoneSelect'
 import JobForm from '../components/JobForm'
@@ -1155,6 +1156,156 @@ function ScriptSourcePanel({ jobId }: { jobId: string }) {
 type CronScriptSource = { source: string; file: string; function: string; truncated: boolean }
 
 /**
+ * Vault-secret grants for a script/command job — the operator half of the
+ * agent-first flow. Renders the agent's pending request as an approve/deny
+ * banner (approval re-verifies the request's code pin server-side), the
+ * active grant, and a small direct-grant editor. Env-var names and vault
+ * secret NAMES only; values never reach this page.
+ */
+export function JobSecretsPanel({ job, onSaved }: { job: CronJob; onSaved: () => void }) {
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  // null = displaying the saved grant; a map = editing a draft of it.
+  const [draft, setDraft] = useState<Record<string, string> | null>(null)
+  const [newEnv, setNewEnv] = useState('')
+  const [newSecret, setNewSecret] = useState('')
+  const { data: vault } = useQuery({
+    queryKey: ['secrets'],
+    queryFn: () => api.secretsList() as Promise<{ names: string[] }>,
+    enabled: open || !!job.secret_env_pending,
+  })
+  const pending = job.secret_env_pending ?? null
+  const active = job.secret_env ?? {}
+  const shown = draft ?? active
+  const act = useCallback(async (body: Parameters<typeof api.cronSecretsGrant>[1]) => {
+    setBusy(true); setError(null)
+    try {
+      await api.cronSecretsGrant(job.id, body)
+      setDraft(null); setNewEnv(''); setNewSecret('')
+      onSaved()
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : i18nT('pages.schedulePage.failed'))
+    } finally { setBusy(false) }
+  }, [job.id, onSaved])
+  return (
+    <div className="flex flex-col gap-1.5">
+      {pending && (
+        <div className="flex flex-col gap-2 px-3 py-2.5 rounded-lg bg-warn-subtle text-warn-fg" role="note">
+          <div className="flex items-center gap-1.5 text-[13px] font-semibold">
+            <KeyRound size={14} className="lucide-inline shrink-0" aria-hidden="true" />
+            {i18nT('pages.schedulePage.secrets_pending_title')}
+          </div>
+          <ul className="flex flex-col gap-0.5 text-[12.5px] font-mono">
+            {Object.entries(pending).map(([env, name]) => (
+              <li key={env}>{env} ← {name}</li>
+            ))}
+          </ul>
+          <div className="text-[12px] opacity-90">{i18nT('pages.schedulePage.secrets_pending_help')}</div>
+          <div className="flex gap-2">
+            <SendBtn
+              disabled={busy}
+              onClick={() =>
+                act({
+                  approve_pending: true,
+                  // Restate what THIS banner displayed: the backend refuses
+                  // (409 stale_request) if the pending request was replaced
+                  // after render, so an unseen request can never be approved.
+                  expected_secret_env: pending,
+                  expected_ts: job.secret_env_pending_ts ?? undefined,
+                })
+              }
+            >
+              {i18nT('pages.schedulePage.secrets_approve')}
+            </SendBtn>
+            <Btn
+              danger
+              disabled={busy}
+              onClick={() => act({ deny_pending: true, expected_secret_env: pending })}
+            >
+              {i18nT('pages.schedulePage.secrets_deny')}
+            </Btn>
+          </div>
+        </div>
+      )}
+      <Clickable
+        className="flex items-center gap-1 w-fit text-[12px] text-muted font-medium hover:text-text cursor-pointer"
+        onClick={() => setOpen(o => !o)}
+        aria-expanded={open}
+      >
+        <ChevronRight size={14} className={`lucide-inline transition-transform ${open ? 'rotate-90' : ''}`} aria-hidden="true" />
+        {i18nT('pages.schedulePage.secrets_section')}
+        {Object.keys(active).length > 0 && <Badge variant="ok">{Object.keys(active).length}</Badge>}
+      </Clickable>
+      {open && (
+        <div className="flex flex-col gap-2">
+          {Object.keys(shown).length === 0 && (
+            <div className="text-[12.5px] text-muted">{i18nT('pages.schedulePage.secrets_none')}</div>
+          )}
+          {Object.entries(shown).map(([env, name]) => (
+            <div key={env} className="flex items-center gap-2 text-[12.5px]">
+              <code className="font-mono text-text">{env}</code>
+              <span className="text-muted" aria-hidden="true">←</span>
+              <code className="font-mono text-muted">{name}</code>
+              <Btn
+                className="p-1 border-0 rounded text-muted hover:text-danger"
+                aria-label={i18nT('pages.schedulePage.secrets_remove')}
+                title={i18nT('pages.schedulePage.secrets_remove')}
+                onClick={() => {
+                  const next = { ...shown }
+                  delete next[env]
+                  setDraft(next)
+                }}
+              >
+                <Trash2 size={13} className="lucide-inline" aria-hidden="true" />
+              </Btn>
+            </div>
+          ))}
+          <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center">
+            <Input
+              value={newEnv}
+              onChange={e => setNewEnv(e.target.value.toUpperCase())}
+              placeholder={i18nT('pages.schedulePage.secrets_env_placeholder')}
+              className="font-mono text-[12.5px] w-full sm:w-[180px]"
+              aria-label={i18nT('pages.schedulePage.secrets_env_placeholder')}
+            />
+            <SimpleSelect
+              options={vault?.names ?? []}
+              value={newSecret}
+              onChange={setNewSecret}
+              triggerFallback={i18nT('pages.schedulePage.secrets_pick_secret')}
+              aria-label={i18nT('pages.schedulePage.secrets_pick_secret')}
+              className="text-[12.5px]"
+            />
+            <Btn
+              disabled={!newEnv.trim() || !newSecret}
+              onClick={() => {
+                setDraft({ ...shown, [newEnv.trim()]: newSecret })
+                setNewEnv(''); setNewSecret('')
+              }}
+            >
+              {i18nT('pages.schedulePage.secrets_add')}
+            </Btn>
+          </div>
+          <div className="text-[12px] text-muted">{i18nT('pages.schedulePage.secrets_active_help')}</div>
+          {draft !== null && (
+            <div className="flex gap-2">
+              <SendBtn disabled={busy} onClick={() => act({ secret_env: draft })}>
+                {i18nT('pages.schedulePage.secrets_save')}
+              </SendBtn>
+              <Btn disabled={busy} onClick={() => { setDraft(null); setNewEnv(''); setNewSecret('') }}>
+                {i18nT('pages.schedulePage.cancel')}
+              </Btn>
+            </div>
+          )}
+        </div>
+      )}
+      {error && <div className="text-danger text-[12.5px]">{error}</div>}
+    </div>
+  )
+}
+
+/**
  * Job detail / create view, rendered as a shadcn (Radix) dialog.
  *
  * Was a resizable side panel pinned to the right of the job list. The dialog
@@ -1223,6 +1374,7 @@ function JobDetailDialog({ job, prefill, prefillWrites, agents, defaultAgent, ro
             <JobForm job={job} prefill={prefill} agents={agents} defaultAgent={defaultAgent} rosterFailure={rosterFailure} onSaved={onSaved} layout="vertical" externalSubmit submitRef={submitRef} onSavingChange={setSaving} />
             {panelError && <div className="text-danger text-[13px]">{panelError}</div>}
             {job?.script && <ScriptSourcePanel jobId={job.id} />}
+            {job && (job.script || job.command) && <JobSecretsPanel job={job} onSaved={onSaved} />}
             {job?.script && (job.last_result || job.last_error) && (
               <div className="flex flex-col gap-1.5">
                 <div className="text-[12px] text-muted font-medium">{job.last_error ? i18nT('pages.schedulePage.last_error') : i18nT('pages.schedulePage.last_output')}</div>

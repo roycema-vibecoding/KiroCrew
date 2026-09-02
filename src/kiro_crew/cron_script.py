@@ -20,9 +20,12 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -66,6 +69,258 @@ _CRON_ENV_DENY: frozenset[str] = frozenset({"KIROCREW_INTERNAL_SECRET", *_AGENT_
 def _clean_cron_env() -> dict[str, str]:
     """Return os.environ minus the cron env-deny set (secrets never inherited)."""
     return {k: v for k, v in os.environ.items() if k not in _CRON_ENV_DENY}
+
+
+# ---------------------------------------------------------------------------
+# Operator-granted vault secrets for script/command crons.
+#
+# A grant maps an env-var NAME -> a vault secret NAME (kiro_crew.secrets
+# SecretVault). It is settable only through operator surfaces (the dashboard
+# grant endpoint); the MCP cron tools never carry the field, so an agent
+# cannot grant itself vault access. At fire time the referenced secrets are
+# resolved in-memory in the pool worker, injected into the child env AFTER the
+# _CRON_ENV_DENY scrub, and never persisted in plaintext.
+#
+# The grant is pinned to the job's code: sha256 over the script body (plus the
+# script spec) or the command text, computed when the operator grants. Scripts
+# under <config_dir>/crons/ are agent-writeable by design, so without the pin
+# a granted job's body could be rewritten into an exfiltrator after approval.
+# A pin mismatch fails the run closed — no injection, no fallback run — until
+# the operator re-approves.
+# ---------------------------------------------------------------------------
+
+#: Grant env-var names: conventional uppercase env grammar only.
+_SECRET_ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+#: Names a grant may never use, beyond the always-scrubbed _CRON_ENV_DENY:
+#: process-behavior variables that would let an injected value alter HOW the
+#: child runs (loader hijack, import shadowing, shell startup) rather than
+#: merely being data the script reads.
+_SECRET_ENV_DENIED_EXACT: frozenset[str] = (
+    frozenset({"PATH", "HOME", "SHELL", "TMPDIR", "IFS", "ENV", "BASH_ENV"}) | _CRON_ENV_DENY
+)
+_SECRET_ENV_DENIED_PREFIXES: tuple[str, ...] = (
+    "KIROCREW",  # product-internal, incl. _KIROCREW_* dial/secret plumbing
+    "_KIROCREW",
+    "LD_",  # ELF loader (LD_PRELOAD / LD_LIBRARY_PATH)
+    "DYLD_",  # macOS loader
+    "PYTHON",  # PYTHONPATH / PYTHONSTARTUP would shadow the launcher's imports
+)
+
+#: Cap mirrors the intent of the per-field caps in cron.py: a grant is a small
+#: hand-written map, not a bulk store.
+_SECRET_ENV_MAX_ENTRIES = 16
+
+
+def validate_secret_env_grant(secret_env: dict[str, str]) -> None:
+    """Validate a secret grant map (env-var name -> vault secret name).
+
+    Raises ValueError naming the offending KEY only — a vault secret name is
+    operator data and may be echoed, but keep messages key-first for
+    consistency with the resolver's no-echo discipline.
+    """
+    if len(secret_env) > _SECRET_ENV_MAX_ENTRIES:
+        raise ValueError(
+            f"secret_env holds {len(secret_env)} entries; max {_SECRET_ENV_MAX_ENTRIES}"
+        )
+    for key, name in secret_env.items():
+        if not isinstance(key, str) or not _SECRET_ENV_NAME_RE.match(key):
+            raise ValueError(
+                f"secret_env key {key!r} is not a valid env-var name " "(expected [A-Z][A-Z0-9_]*)"
+            )
+        if key in _SECRET_ENV_DENIED_EXACT or any(
+            key.startswith(p) for p in _SECRET_ENV_DENIED_PREFIXES
+        ):
+            raise ValueError(f"secret_env key {key!r} is a protected env-var name")
+        if not isinstance(name, str) or not name or name != name.strip():
+            # Mirrors the vault storage boundary (names are stripped on store):
+            # a name that cannot round-trip can never resolve.
+            raise ValueError(
+                f"secret_env entry {key!r} must reference a non-empty vault "
+                "secret name with no leading/trailing whitespace"
+            )
+
+
+def _grant_pin_key() -> bytes:
+    """HMAC key for grant code pins, derived from the agent-fenced vault key.
+
+    A plain hash pin can be recomputed by anything that can write the cron
+    store — on a host whose OS sandbox backend degrades to "none", a cron
+    child is an ordinary subprocess and the store file is reachable — so the
+    pin must be unforgeable, not merely collision-resistant. The key is a
+    purpose-scoped derivation of the EXISTING vault key (a keystone leaf under
+    ``<config_dir>/.vault/`` the agent's tools cannot read and sandboxed cron
+    children never see), so there is no second key file, no separate birth
+    race, and no separate corruption mode: the vault key's exclusive-create
+    birth, fsync durability, and owner-only ACL are inherited. Raises
+    ``ValueError`` when the vault store exists but its key is missing —
+    grants fail closed rather than mint under a fresh key.
+    """
+    from kiro_crew.secrets import SecretVault
+
+    return SecretVault(config_dir()).derive_subkey("cron-grant-pin")
+
+
+def _pin_digest(payload: bytes) -> str:
+    import hmac as _hmac
+
+    return _hmac.new(_grant_pin_key(), payload, hashlib.sha256).hexdigest()
+
+
+def _pin_payload(
+    script: str,
+    command: str,
+    message: str,
+    body: bytes | None,
+    job_id: str,
+    grant: dict[str, str] | None,
+    domain: str,
+) -> bytes:
+    """Canonical byte payload for a grant pin (see compute_secret_env_pin)."""
+    canonical_grant = json.dumps(grant or {}, sort_keys=True, separators=(",", ":")).encode()
+    head = b"v2\x00" + domain.encode() + b"\x00" + job_id.encode() + b"\x00" + canonical_grant
+    if script:
+        assert body is not None
+        return (
+            head + b"\x00script\x00" + script.encode() + b"\x00" + message.encode() + b"\x00" + body
+        )
+    return head + b"\x00command\x00" + command.encode()
+
+
+def compute_secret_env_pin(
+    script: str,
+    command: str,
+    message: str = "",
+    *,
+    job_id: str = "",
+    grant: dict[str, str] | None = None,
+    domain: str = "active",
+    body: bytes | None = None,
+) -> str:
+    """Pin a grant to the job's current code; returns a keyed-HMAC hex digest.
+
+    The pin binds, in one digest: the DOMAIN (``pending`` for an
+    agent-requested grant awaiting approval, ``active`` for an operator-minted
+    grant the runners honour — so a pending pin copied verbatim into the
+    active fields never verifies), the JOB ID (a pin cannot be replayed onto
+    another job), the canonical GRANT MAPPING (swapping which secrets flow
+    under an existing pin breaks it), and the job's code. Script jobs pin the
+    script SPEC, the job ``message``, and the file's current bytes — the
+    message is included because a script reads it as its ARGUMENTS
+    (``ctx.message``: a channel, a URL, a query) and it is agent-updatable via
+    ``cron_update``, so leaving it unpinned would let an approved script be
+    re-aimed at an unapproved destination. Command jobs pin the command text
+    (the message is not delivered to a command child). The digest is
+    HMAC-SHA256 under the vault-fenced grant key (see :func:`_grant_pin_key`),
+    so a pin cannot be forged by editing the cron store — only the product's
+    own grant paths can mint one. Raises
+    (FileNotFoundError/PermissionError/ValueError) when the script spec does
+    not resolve — a grant must never be minted for code that cannot be read.
+
+    ``body`` lets a caller pin SPECIFIC script bytes it already read: two pins
+    derived for one decision (verify the pending, mint the active) MUST come
+    from one snapshot, or an agent swapping the file between two reads would
+    get code the approver never saw blessed with the active pin.
+    """
+    if script:
+        if body is None:
+            file_path, _func = resolve_script_path(script)
+            body = Path(file_path).read_bytes()
+    elif not command:
+        raise ValueError("secret_env requires a script or command job")
+    return _pin_digest(_pin_payload(script, command, message, body, job_id, grant, domain))
+
+
+def _resolve_secret_env(secret_env: dict[str, str]) -> dict[str, str]:
+    """Resolve a validated grant map to plaintext values from the vault.
+
+    Fail-closed: a missing vault entry raises ValueError naming the env-var
+    KEY (never echoing the secret name — same CWE-117 discipline as
+    mcp_gateway.secret_uri). Runs in the cron pool worker thread, so the
+    blocking vault file read is off the event loop.
+    """
+    from kiro_crew.secrets import SecretVault
+
+    vault = SecretVault(config_dir())
+    fetched = vault.get_many(list(secret_env.values()))
+    resolved: dict[str, str] = {}
+    for key, name in secret_env.items():
+        value = fetched.get(name)
+        if value is None:
+            raise ValueError(
+                f"cron secret grant for env var {key!r} references a vault "
+                "secret that does not exist. Store it under Settings > Secrets "
+                "in the dashboard, or update the grant."
+            )
+        resolved[key] = value.reveal()
+    return resolved
+
+
+def _inject_secret_env(clean_env: dict[str, str], resolved: dict[str, str]) -> None:
+    """Merge resolved grant values into the child env (defense in depth).
+
+    Grants are validated at persistence; this re-check only guards a store
+    edited outside the product. Product-internal keys are set AFTER this in
+    both runners, so a grant can never override them even if it slipped past.
+    The skip log carries a COUNT only: the env-var names here flow from the
+    same mapping as the secret values, so logging one keeps tripping taint
+    scanners, and the operator can read the offending names from their own
+    grant table in the dashboard.
+    """
+    skipped = 0
+    for key, value in resolved.items():
+        if (
+            not _SECRET_ENV_NAME_RE.match(key)
+            or key in _SECRET_ENV_DENIED_EXACT
+            or any(key.startswith(p) for p in _SECRET_ENV_DENIED_PREFIXES)
+        ):
+            skipped += 1
+            continue
+        clean_env[key] = value
+    if skipped:
+        logger.warning("cron secret grant: skipped %d protected env key(s)", skipped)
+
+
+def _secret_env_precheck(
+    secret_env: dict[str, str] | None,
+    secret_env_pin: str,
+    script: str = "",
+    command: str = "",
+    script_body: bytes | None = None,
+    message: str = "",
+    job_id: str = "",
+) -> tuple[dict[str, str], str | None]:
+    """Verify the grant pin and resolve secrets; ``(resolved, error)``.
+
+    ``script_body`` carries the bytes the caller already read (and will
+    execute) so the pin covers exactly what runs — never a second read of a
+    file an agent could swap between check and use. The pin is verified in the
+    ``active`` domain with this job's id and mapping bound in (see
+    :func:`compute_secret_env_pin`), so a pending pin, another job's pin, or
+    the same pin over a different mapping all fail closed.
+    """
+    if not secret_env:
+        return {}, None
+    if not secret_env_pin:
+        return {}, "secret grant has no code pin; re-approve it in the dashboard"
+    import hmac as _hmac
+
+    try:
+        current = _pin_digest(
+            _pin_payload(script, command, message, script_body, job_id, secret_env, "active")
+        )
+    except ValueError as exc:  # vault store without key — never inject
+        return {}, str(exc)
+    if not _hmac.compare_digest(current, secret_env_pin):
+        return {}, (
+            "cron code changed since its secret grant was approved; "
+            "secrets were NOT injected. Re-approve the grant in the "
+            "dashboard (Schedule > job > Secrets) to run it again."
+        )
+    try:
+        return _resolve_secret_env(secret_env), None
+    except ValueError as exc:
+        return {}, str(exc)
 
 
 # ── Running-subprocess registry (user-initiated cancellation) ──
@@ -756,14 +1011,58 @@ def _resolve_dial_port() -> int:
 
 
 def run_script_sandboxed(
-    script_path: str, job_id: str, job_message: str = "", timeout: int = 30
+    script_path: str,
+    job_id: str,
+    job_message: str = "",
+    timeout: int = 30,
+    secret_env: dict[str, str] | None = None,
+    secret_env_pin: str = "",
 ) -> dict:
     """Run a cron script in a sandboxed subprocess via wrap_argv().
 
     Returns: {"status": "ok"|"skip"|"done"|"error", "message": "...", "error": "..."}
+
+    ``secret_env``/``secret_env_pin`` carry an operator grant of vault secrets
+    (see the grant block near ``_CRON_ENV_DENY``). When a grant is present the
+    script body is read ONCE here, pin-verified, and the child executes those
+    verified bytes from a private temp copy — the on-disk script (agent-
+    writeable by design) is never re-read by the launcher, so a body swapped
+    in after the check cannot run with the secrets. The temp copy's own dir —
+    not the live ``crons/`` dir — is what goes on ``sys.path``, so a granted
+    script cannot ``import helper`` from the agent-writeable dir either: a
+    sibling module the operator did not approve fails the import instead of
+    running with the secrets. A script that needs siblings must inline them
+    (one approved body) or read them as data.
     """
 
     file_path_str, func_name = resolve_script_path(script_path)
+
+    exec_path_str = file_path_str
+    import_dir_str = os.path.dirname(file_path_str)
+    resolved_secret_env: dict[str, str] = {}
+    pinned_copy: str | None = None
+    pinned_dir: str | None = None
+    if secret_env:
+        try:
+            script_body = Path(file_path_str).read_bytes()
+        except OSError as exc:
+            return {"status": "error", "error": f"Script unreadable: {exc}"}
+        resolved_secret_env, secret_err = _secret_env_precheck(
+            secret_env,
+            secret_env_pin,
+            script=script_path,
+            script_body=script_body,
+            message=job_message,
+            job_id=job_id,
+        )
+        if secret_err:
+            return {"status": "error", "error": f"❌ {secret_err}"}
+        pinned_dir = tempfile.mkdtemp(prefix="kirocrew_cron_pin_")
+        pinned_copy = os.path.join(pinned_dir, os.path.basename(file_path_str))
+        with open(pinned_copy, "wb") as pf:
+            pf.write(script_body)
+        exec_path_str = pinned_copy
+        import_dir_str = pinned_dir
 
     launcher = (
         # Import sys first (builtin, unshadowable) and strip the launcher's own
@@ -778,10 +1077,15 @@ def run_script_sandboxed(
         "from kiro_crew.platform.bootstrap import boot_platform\n"
         "boot_platform(KiroCrewConfig.load())\n"
         "from kiro_crew.cron_script import ScriptContext, Skip, Done, Report\n"
-        f"sys.path.insert(0, os.path.dirname({file_path_str!r}))\n"
+        f"sys.path.insert(0, {import_dir_str!r})\n"
         f"mod = types.ModuleType('_cron_script')\n"
         f"mod.__file__ = {file_path_str!r}\n"
-        f"with open({file_path_str!r}) as f:\n"
+        # exec_path is the pin-verified temp copy when secrets are granted
+        # (the original path otherwise), and import_dir matches it — the
+        # pinned temp dir, never the live crons/ dir. The compile filename
+        # stays the original so tracebacks point at the file the operator
+        # knows.
+        f"with open({exec_path_str!r}) as f:\n"
         f"    exec(compile(f.read(), {file_path_str!r}, 'exec'), mod.__dict__)\n"
         f"fn = getattr(mod, {func_name!r}, None)\n"
         "if fn is None:\n"
@@ -840,6 +1144,10 @@ def run_script_sandboxed(
         # Build clean env: secrets (Slack tokens, owner id, internal secret)
         # are never inherited; the internal secret is passed via the 0600 file.
         clean_env = _clean_cron_env()
+        # Operator-granted vault secrets go in FIRST so every product-internal
+        # key set below wins over a grant unconditionally.
+        if resolved_secret_env:
+            _inject_secret_env(clean_env, resolved_secret_env)
         clean_env["_KIROCREW_SECRET_FILE"] = secret_path
         # The child must dial the gateway the credential above was minted for:
         # same dial_port, resolved once above, not a second resolution here.
@@ -917,6 +1225,8 @@ def run_script_sandboxed(
     finally:
         Path(launcher_path).unlink(missing_ok=True)
         Path(secret_path).unlink(missing_ok=True)
+        if pinned_dir:
+            shutil.rmtree(pinned_dir, ignore_errors=True)
         if sandbox_cleanup:
             Path(sandbox_cleanup).unlink(missing_ok=True)
 
@@ -1028,11 +1338,26 @@ def _shell_is_posix_strict(shell: str) -> bool:
     return result
 
 
-def run_command_sandboxed(command: str, timeout: int = 300, job_id: str | None = None) -> dict:
+def run_command_sandboxed(
+    command: str,
+    timeout: int = 300,
+    job_id: str | None = None,
+    secret_env: dict[str, str] | None = None,
+    secret_env_pin: str = "",
+) -> dict:
     """Run a shell command in a sandboxed subprocess via wrap_argv().
 
     Returns: {"status": "ok"|"error"|"cancelled", "output": "...", "exit_code": N}
+
+    ``secret_env``/``secret_env_pin`` carry an operator grant of vault secrets
+    pinned to the command text (see the grant block near ``_CRON_ENV_DENY``);
+    a changed command fails closed without injection.
     """
+    resolved_secret_env, secret_err = _secret_env_precheck(
+        secret_env, secret_env_pin, command=command, job_id=job_id or ""
+    )
+    if secret_err:
+        return {"status": "error", "output": f"❌ {secret_err}", "exit_code": -1}
     shell = _resolve_command_shell()
     if shell is None:
         return {
@@ -1069,6 +1394,8 @@ def run_command_sandboxed(command: str, timeout: int = 300, job_id: str | None =
         sandboxed_argv, sandbox_cleanup = wrap_argv(argv, mode="cc")
         sandboxed_argv = cgroup_scope_argv(sandboxed_argv)  # cgroup DoS ceiling
         clean_env = _clean_cron_env()
+        if resolved_secret_env:
+            _inject_secret_env(clean_env, resolved_secret_env)
         proc = popen_limited(
             sandboxed_argv,
             stdout=subprocess.PIPE,

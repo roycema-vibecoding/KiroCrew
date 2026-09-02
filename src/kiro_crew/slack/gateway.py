@@ -3571,6 +3571,8 @@ class GatewayOrchestrator:
                         job.command,
                         cmd_timeout,
                         job.id,
+                        job.secret_env,
+                        job.secret_env_pin,
                         timeout=_claim_backstop(job, cmd_timeout),
                     )
                     if result.get("status") == "cancelled":
@@ -3898,6 +3900,8 @@ class GatewayOrchestrator:
                         job.id,
                         job.message,
                         script_timeout,
+                        job.secret_env,
+                        job.secret_env_pin,
                         timeout=_claim_backstop(job, script_timeout),
                     )
                     status = result.get("status", "error")

@@ -59,3 +59,33 @@ def trigger_cron_job(job_id: str, port: int, secret_path: Path) -> tuple[bool, s
         return False, f"Error: HTTP {e.code}"
     except (urllib.error.URLError, OSError):
         return False, "Error: cannot reach gateway. Is `kirocrew gateway` running?"
+
+
+def post_secret_request_card(job_id: str, session_key: str, port: int, secret_path: Path) -> bool:
+    """Ask the gateway to raise the inline secret-approval card; best-effort.
+
+    Returns True when the gateway confirmed a card was posted into the
+    requesting session's chat slot, False otherwise (no dashboard slot for the
+    session, gateway unreachable, older gateway without the route). The caller
+    treats False as "point the user at the Schedule page instead" — the
+    durable pending record exists either way, so this never gates correctness.
+    Same credential resolution as :func:`trigger_cron_job`: per-port run
+    marker first, home-wide fallback second.
+    """
+    if not _JOB_ID_RE.fullmatch(job_id):
+        return False
+    url = f"http://127.0.0.1:{port}/api/crons/{job_id}/secret-request-card"
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    secret = run_marker.read_secret(port)
+    if not secret and secret_path.exists():
+        secret = secret_path.read_text().strip()
+    if secret:
+        headers["X-Internal-Secret"] = secret
+    payload = json.dumps({"session_key": session_key}).encode()
+    try:
+        req = urllib.request.Request(url, method="POST", data=payload, headers=headers)
+        with loopback_urlopen(req, timeout=_TIMEOUT_SECS) as resp:
+            body = json.loads(resp.read())
+            return bool(body.get("ok")) and bool(body.get("card"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return False

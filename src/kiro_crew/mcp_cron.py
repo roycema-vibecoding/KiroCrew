@@ -10,6 +10,9 @@ Tools:
     cron_remove_all — remove all jobs
     cron_pause      — pause a job
     cron_resume     — resume a paused job
+    cron_secret_request — request vault secrets for an owned script/command
+                          job (records a PENDING grant; operator approves in
+                          the dashboard — this tool never grants)
 """
 
 from __future__ import annotations
@@ -36,8 +39,12 @@ from kiro_crew.cron import (
     is_valid_skip_date,
     is_valid_timezone,
 )
-from kiro_crew.cron_script import resolve_script_path
-from kiro_crew.cron_trigger import _JOB_ID_RE, trigger_cron_job
+from kiro_crew.cron_script import (
+    compute_secret_env_pin,
+    resolve_script_path,
+    validate_secret_env_grant,
+)
+from kiro_crew.cron_trigger import _JOB_ID_RE, post_secret_request_card, trigger_cron_job
 from kiro_crew.mcp_caller import current_caller
 from kiro_crew.mcp_core import (
     _resolve_session_key,
@@ -1261,6 +1268,37 @@ def _list_tools() -> list[dict[str, Any]]:
                 "required": ["job_id"],
             },
         },
+        {
+            "name": "cron_secret_request",
+            "description": (
+                "Request vault secrets for a script/command cron job you own. "
+                "This does NOT grant anything: it records a PENDING request "
+                "(env-var name -> vault secret name, pinned to the job's "
+                "current code) that the operator must approve in the dashboard "
+                "(Schedule > job > Secrets) before the values are injected "
+                "into the job's subprocess env at fire time. Tell the user to "
+                "approve it. Secrets must already exist in the vault "
+                "(Settings > Secrets). An empty 'secrets' object withdraws a "
+                "pending request."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "Job ID to request secrets for"},
+                    "secrets": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": (
+                            "Mapping of env-var name (e.g. 'MY_SANDBOX_TOKEN', "
+                            "[A-Z][A-Z0-9_]*) to the vault secret name to "
+                            "inject under it. Empty object withdraws the "
+                            "pending request."
+                        ),
+                    },
+                },
+                "required": ["job_id", "secrets"],
+            },
+        },
     ]
 
 
@@ -2120,6 +2158,103 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         if ok:
             return f"{msg} - executing now."
         return msg
+
+    if name == "cron_secret_request":
+        jid = args["job_id"]
+        # Ownership check — a session may only request secrets for a job it owns.
+        own_err = _check_cron_job_ownership(svc, jid)
+        if own_err:
+            return own_err
+        secrets = args.get("secrets")
+        if not isinstance(secrets, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in secrets.items()
+        ):
+            return "Error: secrets must be an object mapping env-var names to vault secret names"
+        sjob = svc.get_job(jid)
+        if sjob is None:
+            return f"Error: job not found: {jid}"
+        if not secrets:
+            try:
+                svc.update_job(jid, secret_env_pending={})
+            except CronStoreBusy:
+                return "Error: cron store busy, please retry"
+            return "Withdrew the pending secret request."
+        if not (sjob.script or sjob.command):
+            return (
+                "Error: secret grants apply only to script/command jobs — an "
+                "agent job's session would expose the plaintext to the model."
+            )
+        try:
+            validate_secret_env_grant(secrets)
+        except ValueError as exc:
+            return f"Error: {redact(str(exc))}"
+        # Existence check now, so a request the operator could approve but that
+        # could never fire is refused while the agent can still fix it.
+        from kiro_crew.secrets import SecretVault
+
+        missing_names = sorted(set(secrets.values()) - set(SecretVault(config_dir()).list_names()))
+        if missing_names:
+            return (
+                "Error: not stored in the vault: "
+                + ", ".join(missing_names)
+                + ". Ask the user to add them under Settings > Secrets first, "
+                "then request again."
+            )
+        try:
+            # Pin the REQUEST to the job's current code. Approval re-verifies
+            # this pin against the code at approval time, so what the operator
+            # blesses is exactly what the agent showed them.
+            pin = compute_secret_env_pin(
+                sjob.script,
+                sjob.command,
+                sjob.message,
+                job_id=sjob.id,
+                grant=secrets,
+                domain="pending",
+            )
+        except (ValueError, FileNotFoundError, PermissionError, RuntimeError) as exc:
+            return f"Error: {redact(str(exc))}"
+        try:
+            svc.update_job(
+                jid,
+                secret_env_pending=dict(secrets),
+                secret_env_pending_pin=pin,
+                secret_env_pending_ts=time.time(),
+            )
+        except CronStoreBusy:
+            return "Error: cron store busy, please retry"
+        except CronStoreUnreadable as exc:
+            return f"Error: {exc}"
+        except ValueError as exc:
+            return f"Error: {redact(str(exc))}"
+        sel().log_api_access(
+            caller="mcp",
+            operation="cron.secret_request",
+            outcome="allowed",
+            source="mcp",
+            resources=f"job_id={jid}:{','.join(sorted(secrets))}",
+        )
+        # Best-effort inline approval card in the requesting conversation —
+        # the durable pending record above is the source of truth either way.
+        card_posted = post_secret_request_card(
+            jid,
+            _authz_session_key(),
+            resolve_serving_port(),
+            config_dir() / ".local_secret",
+        )
+        if card_posted:
+            return (
+                f"Recorded a PENDING secret request for job {jid} "
+                f"({', '.join(sorted(secrets))}) and posted an approval card in "
+                "this conversation. Nothing is granted until the user approves "
+                "it — on the card, or later under Schedule > this job > Secrets."
+            )
+        return (
+            f"Recorded a PENDING secret request for job {jid} "
+            f"({', '.join(sorted(secrets))}). Nothing is granted yet: the "
+            "operator must approve it in the dashboard under Schedule > this "
+            "job > Secrets. Tell the user to review and approve it there."
+        )
 
     return f"Unknown tool: {name}"
 
