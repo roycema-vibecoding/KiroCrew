@@ -901,7 +901,21 @@ token with an attached `=` value never disturbs the split, whatever the option, 
 it is skipped as before; a bare `--` ends option parsing exactly as git reads it.
 The invariant this buys: an unrecognised option can change the answer only toward
 MORE protection, so the erasure class cannot silently reopen when git grows a new
-value-taking option. (Note the earlier retraction of a 35-entry option table on
+value-taking option. The same fallback covers word FRAGMENTS: the scan tokenizes
+on whitespace while the shell fuses a quoted or escape-continued span into one
+word, so a value like `--push-option='ci skip'` arrives as fragments whose tail
+would read as a refspec. `_push_token_is_word_fragment` walks the shell's own
+quote/escape state over each raw token — backslash escapes outside quotes, inside
+double quotes, and inside `$'...'` ANSI-C strings, but is literal inside plain
+single quotes — and any token whose state does not return to normal (an open
+quote, or a trailing escape that consumed the separator) poisons the positional
+split the same protective way. An ESCAPED quote is data, not a delimiter: a
+character-count/parity test was bypassed by `\"` in review, which is why the walk
+tracks state rather than counting. Complete words keep their precise reading in
+both directions — `"feat\"x"` is not flagged, and the quote-splice `'ma'\''in'`
+still reads as exactly the protected-branch row. The `$`-lookback for ANSI-C can
+misread `$$'` (PID expansion) as ANSI-C, which only ever OVER-flags, never the
+reverse. (Note the earlier retraction of a 35-entry option table on
 the dangerous-PREFIX axis is not precedent against these tables: prefix matching
 is a set intersection where extra names are inert, while arity decides which
 tokens are refspecs at all, so a table here does change outcomes.)

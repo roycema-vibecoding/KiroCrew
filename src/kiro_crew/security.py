@@ -5480,6 +5480,70 @@ _PUSH_VALUE_SHORTS = frozenset({"o"})
 _PUSH_NO_VALUE_SHORTS = frozenset({"f", "n", "q", "v", "u", "d", "4", "6"})
 
 
+def _push_token_is_word_fragment(token: str) -> bool:
+    """True when a RAW (pre-dequote) token is a fragment of a shell word.
+
+    The scan tokenizes on whitespace, but the shell fuses a quoted or
+    escape-continued span containing whitespace into ONE word — so a value
+    like ``--push-option='ci skip'`` arrives here as two fragments, and the
+    tail fragment would be read as a refspec, erasing the floor tag exactly
+    the way #7796's separated values did.
+
+    A token is a fragment exactly when the shell's quote/escape state has not
+    RETURNED TO NORMAL by the token's end: an open quote or a trailing escape
+    means the whitespace that split this token was itself quoted or escaped —
+    fused into the word. The walk uses the shell's own rules: a backslash
+    escapes the next character outside quotes, inside double quotes, and
+    inside ``$'...'`` ANSI-C strings, but is LITERAL inside plain single
+    quotes; an ESCAPED quote is data, not a delimiter. (Counting quote
+    characters — the previous shape here — was bypassed by ``\\"``: the escaped
+    quote flipped the parity even though it closes nothing. Found by the GPT
+    5.6 review lane on #7808.) A complete word with escaped quotes therefore
+    keeps its precise reading, both directions: no spurious fragment flag, and
+    no lost protected tag. The ``$``-lookback for ANSI-C can misread ``$$'``
+    (PID expansion) as ANSI-C, but that direction only ever OVER-flags — a
+    plain-single reading closes at every quote the ANSI reading skips, so the
+    walk can end "still open" where bash split normally, never the reverse.
+    Detection stays per-token and protective-only: a hit poisons the
+    positional split (the fail-protective fallback), never widens an allow.
+    """
+    state = 0  # 0 = normal, 1 = single-quoted, 2 = double-quoted
+    ansi = False  # the open single quote was $'...' (ANSI-C): backslash escapes
+    i = 0
+    n = len(token)
+    while i < n:
+        ch = token[i]
+        if state == 0:
+            if ch == "\\":
+                if i + 1 >= n:
+                    return True  # the escaped character was the separator
+                i += 2
+                continue
+            if ch == "'":
+                state = 1
+                ansi = i > 0 and token[i - 1] == "$"
+            elif ch == '"':
+                state = 2
+        elif state == 1:
+            if ansi and ch == "\\":
+                if i + 1 >= n:
+                    return True  # escapes the separator inside $'...'
+                i += 2
+                continue
+            if ch == "'":
+                state = 0
+        else:  # state == 2, inside double quotes
+            if ch == "\\":
+                if i + 1 >= n:
+                    return True  # escaped separator / continuation
+                i += 2
+                continue
+            if ch == '"':
+                state = 0
+        i += 1
+    return state != 0
+
+
 def _push_option_matches(token: str, names: "frozenset[str]") -> bool:
     """True when ``token`` is ``--`` plus a PREFIX of any option in ``names``.
 
@@ -5632,10 +5696,14 @@ def _push_segment_targets_protected(arg_tokens: list[str]) -> frozenset[str]:
     # split that may contain a leaked option value is how the floor tag was
     # erased. A bare ``--`` ends option parsing, exactly as git reads it.
     repo_in_flag = False
-    unrecognised_option = False
     positional_only = False
     non_flags: list[str] = []
     skip_next = False
+    # A raw token carrying an unbalanced quote or an escaped trailing
+    # separator means the shell fused a whitespace-spanning word this
+    # whitespace tokenizer has split apart — no per-token reading of the
+    # fragments can be trusted, so the split is poisoned protectively.
+    unrecognised_option = any(_push_token_is_word_fragment(t) for t in arg_tokens)
     for tok in tokens:
         if skip_next:
             skip_next = False

@@ -738,6 +738,60 @@ class TestUnrecognisedOptionsReadProtectively:
         tags = security._git_publish_floor_tags("git push -z origin feature-x")
         assert "git-publish-push-bare" in tags
 
+    def test_a_quoted_value_containing_whitespace_reads_protectively(self):
+        # GPT 5.6 review findings on #7808 (rounds 1-2), verified real: the
+        # tokenizer is whitespace-split, so a quoted (or escape-continued)
+        # value spanning whitespace reaches the scan as FRAGMENTS — consuming
+        # one token left the tail fragment trusted as a refspec, and the
+        # erasure was back. Round 2: an ESCAPED quote is data, not a
+        # delimiter, so counting quote characters was bypassed by \" — the
+        # fragment test now tracks the shell's own quote/escape state and
+        # flags any token whose state does not return to normal.
+        for cmd in (
+            "git push --repo=origin --push-option='ci skip'",
+            'git push --repo=origin --push-option="ci skip"',
+            "git push --repo=origin --push-option 'ci skip'",
+            "git push --repo=origin -o 'ci skip'",
+            "git push --repo=origin --push-option=ci\\ skip",
+            'git push --repo=origin --push-option="ci\\" skip\\""',
+            "git push --repo=origin --push-option='ci'\\'' skip'",
+            "git push --repo=origin --push-option=$'ci\\' skip'",
+            # ANSI-C-only signal: under a plain-single reading BOTH fragments
+            # scan clean (the tail's quotes pair up), so this row is what
+            # proves the $'...' escape branch is load-bearing.
+            "git push --repo=origin --push-option=$'a\\' bc'\\''d'",
+        ):
+            tags = security._git_publish_floor_tags(cmd)
+            assert "git-publish-push-bare" in tags, (
+                f"{cmd!r}: a whitespace-fused option value erased the floor "
+                f"tag again: {set(tags)}"
+            )
+
+    def test_a_protected_name_beside_a_fragmented_value_keeps_its_tag(self):
+        tags = security._git_publish_floor_tags("git push --push-option='ci skip' origin main")
+        assert "git-publish-push-protected-branch-name" in tags
+
+    def test_balanced_quoting_still_parses_precisely(self):
+        # The fragment signal is the quote/escape state not returning to
+        # normal; complete words — including ones with ESCAPED quotes — keep
+        # their existing precise reading, both directions: no over-deny of a
+        # feature push, and no loss of the precise tag identity.
+        assert not security._git_publish_floor_tags("git push origin 'feature-x'")
+        assert "git-publish-push-protected-branch-name" in security._git_publish_floor_tags(
+            "git push origin 'main'"
+        )
+        assert security._git_publish_floor_tags(
+            'git push --repo=origin "--push-option=ci.skip"'
+        ) == frozenset({"git-publish-push-bare"})
+        # An escaped quote inside a COMPLETE word is data, not a fragment.
+        assert not security._git_publish_floor_tags('git push origin "feat\\"x"')
+        # The quote-splice spelling of a protected name reads EXACTLY as the
+        # protected-branch row: dequote evasion-resistance intact, and no
+        # spurious bare tag riding along from a fragment false-positive.
+        assert security._git_publish_floor_tags("git push origin 'ma'\\''in'") == frozenset(
+            {"git-publish-push-protected-branch-name"}
+        )
+
     def test_the_protective_reading_still_names_a_protected_target_precisely(self):
         # Not trusting the split widens the refspec scan to EVERY positional,
         # so a protected name still reports its own catalog row — an operator
