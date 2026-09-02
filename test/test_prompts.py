@@ -110,16 +110,80 @@ def _user_prompt(tmp_path, name, content="# Placeholder"):
     return p
 
 
-def _api_request(name):
+# The slot key every single-slot request stub binds under; the stubs send it as
+# the ``X-Session-Key`` header, the header the handlers resolve "local" from.
+_SLOT_KEY = "default"
+
+
+def _slot_state(project=None, owner="owner-1", slots=None, slot_app=""):
+    """A MagicMock DashboardState carrying real chat slots.
+
+    ``_prompt_local_project`` reads ``state._slots`` and the named slot's
+    ``.project``, so the state has to carry a real ``_slots`` dict (a bare
+    ``MagicMock`` would make the resolver iterate a mock and blow up). Single-slot
+    form: pass ``project`` to bind the lone ``_SLOT_KEY`` slot (empty/None → no
+    project, the "no active project" path the refusal tests exercise). Multi-slot
+    form: pass ``slots={key: project_or_"", ...}`` to build several named slots so
+    a test can prove which one a request resolves. ``slot_app`` sets every slot's
+    owning app (``_ChatSlot._app``), which the app-isolation branch compares
+    against the request's own app claim.
+    """
+    if slots is None:
+        slots = {_SLOT_KEY: str(project) if project else ""}
+    slot_objs = {
+        key: MagicMock(project=str(proj) if proj else "", _app=slot_app)
+        for key, proj in slots.items()
+    }
+    state = MagicMock(_slots=slot_objs)
+    state.owner_id = owner
+    return state
+
+
+def _claim_store(request, app=""):
+    """Wire ``request.get("app")`` on a MagicMock stub.
+
+    A bare ``MagicMock.get`` answers a truthy mock for every key, which would
+    make ``_prompt_local_project`` treat a dashboard request as an app caller. The
+    stubs must therefore carry a real claim store, defaulting to the
+    present-and-empty claim that means "dashboard".
+    """
+    store = {"app": app}
+    request.get = MagicMock(side_effect=lambda k, d=None: store.get(k, d))
+    return request
+
+
+def _list_request(project=None, session_key=_SLOT_KEY, state=None, app=""):
+    """GET /api/prompts request stub. ``api_prompts`` resolves the local project
+    from ``request.app["state"]`` plus the ``X-Session-Key`` header, so the stub
+    needs a real ``_slots`` state and (usually) that header. ``project`` binds the
+    lone slot so its local prompts are listed; pass an explicit ``state`` +
+    ``session_key`` to drive a multi-slot scenario, and ``app`` for an
+    app-token caller."""
+    r = MagicMock()
+    r.headers = {"X-Session-Key": session_key} if session_key else {}
+    r.app = {"state": state if state is not None else _slot_state(project)}
+    return _claim_store(r, app)
+
+
+def _api_request(name, project=None, session_key=_SLOT_KEY, state=None, app=""):
+    """GET /api/prompts/{name} (unscoped) request stub.
+
+    The unscoped detail branch resolves the local project through the same
+    ``_prompt_local_project`` seam the lister uses, so the stub carries a real
+    ``_slots`` state and an ``X-Session-Key`` header. ``project`` binds the lone
+    slot so a bare (unscoped) local prompt resolves against it.
+    """
     r = MagicMock()
     r.match_info = {"name": name}
-    return r
+    r.headers = {"X-Session-Key": session_key} if session_key else {}
+    r.app = {"state": state if state is not None else _slot_state(project)}
+    return _claim_store(r, app)
 
 
 class _Slot:
     """Minimal slot/state stub for prompt tests."""
 
-    def __init__(self):
+    def __init__(self, project=""):
         self.messages = []
         self.key = "t"
         self.agent = "kirocrew"
@@ -127,6 +191,10 @@ class _Slot:
         self._queue = []
         self._stop_generation = 0
         self.linked_session_key = ""
+        # Mirrors _ChatSlot.project: the per-slot local project @mention/​/prompts
+        # resolve against. "" means no project (global prompts only), matching
+        # the fail-closed default of the real slot.
+        self.project = project
 
     def append(self, role, text, cls):
         self.messages.append((role, text, cls))
@@ -237,13 +305,17 @@ class TestListAimPrompts:
         assert len(r) == 1
         assert (r[0]["name"], r[0]["source"]) == ("my-prompt", "global")
 
-    def test_discovers_local_project_prompts(self, tmp_path, monkeypatch):
+    def test_discovers_local_project_prompts(self, tmp_path):
+        # Local prompts now come from the per-slot project the CALLER resolves
+        # and passes in, not from the gateway-global _project_dir(); drive it
+        # through the new project_dir argument.
         proj = tmp_path / "proj"
-        monkeypatch.setattr("kiro_crew.agent._project_dir", lambda: proj)
         d = proj / ".kiro" / "prompts"
         d.mkdir(parents=True)
         (d / "local.md").write_text("# L\n")
-        assert any(r["source"] == "local" for r in _list_aim_prompts())
+        assert any(r["source"] == "local" for r in _list_aim_prompts(proj))
+        # With no project_dir the same local prompt is NOT discovered.
+        assert not any(r["source"] == "local" for r in _list_aim_prompts())
 
     def test_empty(self, tmp_path):
         assert _list_aim_prompts() == []
@@ -317,7 +389,7 @@ class TestExpandPromptMention:
     def test_list_error_returns_original(self, monkeypatch):
         monkeypatch.setattr(
             "kiro_crew.dashboard.handlers._find_prompt",
-            lambda n: (_ for _ in ()).throw(PermissionError),
+            lambda n, project_dir=None: (_ for _ in ()).throw(PermissionError),
         )
         msg, status = _expand_prompt_mention("@x", _State(), _Slot())
         assert (msg, status) == ("@x", "not_found")
@@ -346,7 +418,7 @@ class TestExpandPromptMention:
 class TestApiPrompts:
     def test_list(self, aim_dir, mock_sel):
         _aim_pkg(aim_dir, "Pkg-1.0", "1", {"sop": "# S\n"})
-        resp = asyncio.run(api_prompts(MagicMock()))
+        resp = asyncio.run(api_prompts(_list_request()))
         body = json.loads(resp.body)
         assert resp.status == 200 and len(body) == 1 and body[0]["name"] == "sop"
 
@@ -469,16 +541,16 @@ class TestRunChatPrompts:
     def test_api_prompts_does_not_corrupt_cache(self, aim_dir, mock_sel):
         """GET /api/prompts must not mutate cached paths (regression)."""
         _aim_pkg(aim_dir, "Pkg-1.0", "1", {"sop": "# S\nContent."})
-        asyncio.run(api_prompts(MagicMock()))
+        asyncio.run(api_prompts(_list_request()))
         # After the API call, @mention expansion must still resolve the prompt
-        msg, status = _expand_prompt_mention("@agent-sop:sop", MagicMock(), MagicMock())
+        msg, status = _expand_prompt_mention("@agent-sop:sop", _State(), _Slot())
         assert status == "ok", f"Cache corrupted: expansion returned {status!r}"
 
 
 # ── Prompt authoring (create / update / delete) ──
 
 
-def _create_request(body, app="", user="owner-1", owner="owner-1"):
+def _create_request(body, app="", user="owner-1", owner="owner-1", project=None):
     """POST /api/prompts request stub. ``body`` of None simulates unparseable JSON.
 
     ``app`` is the auth middleware's app claim: "" (default) is a dashboard
@@ -488,6 +560,8 @@ def _create_request(body, app="", user="owner-1", owner="owner-1"):
     (``is_owner_dashboard_request`` requires the claim present-and-empty AND
     the caller to equal the configured owner); pass a mismatched ``user`` to
     exercise the non-owner refusal, or ``owner=""`` for the no-owner install.
+    ``project`` binds the request's chat slot to a project so a ``local`` scope
+    resolves against it (per-slot resolution); the default is no slot project.
     """
     r = MagicMock()
     r.method = "POST"
@@ -495,9 +569,10 @@ def _create_request(body, app="", user="owner-1", owner="owner-1"):
     r.get = MagicMock(side_effect=lambda k, d=None: store.get(k, d))
     r.__contains__ = lambda _self, key: key in store
     r.__getitem__ = lambda _self, key: store[key]
-    state = MagicMock()
-    state.owner_id = owner
-    r.app = {"state": state}
+    # Name the slot so requesting_slot_project selects it (step 1); a "local"
+    # scope resolves against THIS slot's project, the same seam create/list share.
+    r.headers = {"X-Session-Key": _SLOT_KEY}
+    r.app = {"state": _slot_state(project, owner)}
     if body is None:
         r.json = AsyncMock(side_effect=ValueError("no json"))
     else:
@@ -506,13 +581,15 @@ def _create_request(body, app="", user="owner-1", owner="owner-1"):
 
 
 def _write_request(
-    method, name, scope="global", body=None, app="", user="owner-1", owner="owner-1"
+    method, name, scope="global", body=None, app="", user="owner-1", owner="owner-1", project=None
 ):
     """PUT/DELETE /api/prompts/{name}?scope= request stub.
 
     ``app`` mirrors ``_create_request``: "" dashboard user, a name for an
     app-token caller, None for an absent claim (fails closed). ``user``/
-    ``owner`` mirror it too: the default is an owner match.
+    ``owner`` mirror it too: the default is an owner match. ``project`` binds
+    the request's chat slot to a project so a ``local`` scope resolves against
+    it (per-slot resolution); the default is no slot project.
     """
     r = MagicMock()
     r.method = method
@@ -520,9 +597,10 @@ def _write_request(
     r.get = MagicMock(side_effect=lambda k, d=None: store.get(k, d))
     r.__contains__ = lambda _self, key: key in store
     r.__getitem__ = lambda _self, key: store[key]
-    state = MagicMock()
-    state.owner_id = owner
-    r.app = {"state": state}
+    # Name the slot so requesting_slot_project selects it (step 1); a "local"
+    # scope resolves against THIS slot's project, the same seam create/list share.
+    r.headers = {"X-Session-Key": _SLOT_KEY}
+    r.app = {"state": _slot_state(project, owner)}
     r.match_info = {"name": name}
     r.query = {"scope": scope} if scope is not None else {}
     r.json = (
@@ -543,9 +621,12 @@ def _sha(text: str) -> str:
 _ANY_HASH = "0" * 64
 
 
-def _listed_names():
-    """Names currently visible through the list endpoint."""
-    return [p["name"] for p in json.loads(asyncio.run(api_prompts(MagicMock())).body)]
+def _listed_names(project=None):
+    """Names currently visible through the list endpoint.
+
+    ``project`` binds the listing request's chat slot to a project so its
+    ``source: "local"`` prompts are included (per-slot resolution)."""
+    return [p["name"] for p in json.loads(asyncio.run(api_prompts(_list_request(project))).body)]
 
 
 def _outcomes(mock_sel):
@@ -565,15 +646,187 @@ class TestApiPromptsCreate:
         assert (tmp_path / ".kiro" / "prompts" / "my-prompt.md").read_text() == "# Hi"
         assert _listed_names() == ["my-prompt"]
 
-    def test_creates_in_local_scope_under_project(self, tmp_path, monkeypatch, mock_sel):
+    def test_creates_in_local_scope_under_project(self, tmp_path, mock_sel):
+        # The local project now comes from the request's chat slot (per-slot),
+        # not the gateway-global _project_dir(); bind the slot via project=.
         proj = tmp_path / "proj"
         proj.mkdir()
-        monkeypatch.setattr("kiro_crew.agent._project_dir", lambda: proj)
         resp = asyncio.run(
-            api_prompts_create(_create_request({"name": "p", "content": "x", "scope": "local"}))
+            api_prompts_create(
+                _create_request({"name": "p", "content": "x", "scope": "local"}, project=proj)
+            )
         )
         assert resp.status == 201
         assert (proj / ".kiro" / "prompts" / "p.md").is_file()
+
+    def test_local_create_is_listed_for_the_same_slot(self, tmp_path, mock_sel):
+        """The create/list invariant, per slot: a local prompt created under a
+        slot's project is then listed for that SAME slot. Both sides resolve
+        "local" from the same per-slot project, so create and list agree."""
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        resp = asyncio.run(
+            api_prompts_create(
+                _create_request(
+                    {"name": "slot-local", "content": "x", "scope": "local"}, project=proj
+                )
+            )
+        )
+        assert resp.status == 201
+        # Listed for the SAME slot (bound to the same project) …
+        assert "slot-local" in _listed_names(project=proj)
+
+    def test_local_create_is_not_listed_for_a_different_slot(self, tmp_path, mock_sel):
+        """The bug #7345 fixes: a local prompt created under slot A's project
+        must NOT leak into a different slot B bound to a different project.
+        Per-slot resolution keeps each slot's local prompts to itself."""
+        proj_a = tmp_path / "proj-a"
+        proj_a.mkdir()
+        proj_b = tmp_path / "proj-b"
+        proj_b.mkdir()
+        resp = asyncio.run(
+            api_prompts_create(
+                _create_request(
+                    {"name": "a-only", "content": "x", "scope": "local"}, project=proj_a
+                )
+            )
+        )
+        assert resp.status == 201
+        # Visible to slot A (its own project) …
+        assert "a-only" in _listed_names(project=proj_a)
+        # … but NOT to slot B, which is bound to a different project.
+        assert "a-only" not in _listed_names(project=proj_b)
+        # … and NOT to a slot with no project at all.
+        assert "a-only" not in _listed_names()
+
+    def test_session_key_header_selects_the_slots_project(self, tmp_path, mock_sel):
+        """The step-1 header-selects-a-slot path the handlers actually rely on.
+
+        With TWO real slots bound to different projects in one state,
+        ``requesting_slot_project`` must resolve the project of the slot named
+        by the ``X-Session-Key`` header — not a cross-slot fallback (there is
+        none) and not the other slot's project. Each slot's own local prompt is
+        listed only when its key is the one on the request; the OTHER slot's
+        local prompt never leaks in. This is the multi-slot selection the
+        empty-header single-slot tests never exercise."""
+        proj_a = tmp_path / "sel-a"
+        proj_a.mkdir()
+        proj_b = tmp_path / "sel-b"
+        proj_b.mkdir()
+        # Author one local prompt under each project's .kiro/prompts.
+        _user_prompt(proj_a, "in-a")
+        _user_prompt(proj_b, "in-b")
+        state = _slot_state(slots={"slot-a": proj_a, "slot-b": proj_b})
+
+        # Header names slot A → A's project wins: A's local prompt, not B's.
+        names_a = [
+            p["name"]
+            for p in json.loads(
+                asyncio.run(api_prompts(_list_request(session_key="slot-a", state=state))).body
+            )
+        ]
+        assert "in-a" in names_a
+        assert "in-b" not in names_a
+
+        # Header names slot B → B's project wins: B's local prompt, not A's.
+        names_b = [
+            p["name"]
+            for p in json.loads(
+                asyncio.run(api_prompts(_list_request(session_key="slot-b", state=state))).body
+            )
+        ]
+        assert "in-b" in names_b
+        assert "in-a" not in names_b
+
+        # No/empty header, and the two slots disagree about the project → no
+        # defensible answer, so neither slot's local prompt is listed. Picking
+        # one would show the Prompts tab a checkout the user did not ask about,
+        # and a following local write would land in it.
+        names_none = [
+            p["name"]
+            for p in json.loads(
+                asyncio.run(api_prompts(_list_request(session_key="", state=state))).body
+            )
+        ]
+        assert "in-a" not in names_none
+        assert "in-b" not in names_none
+
+    def test_slotless_dashboard_request_uses_the_single_shared_project(self, tmp_path, mock_sel):
+        """The overview Prompts tab and the command palette are the ONLY surfaces
+        that offer "This project", and neither sits inside a chat: they send no
+        slot key (or the shared ``dashboard:ui`` placeholder, which names no
+        slot). A resolver with no fallback answers ``None`` for every request
+        they can make, so the scope they render would be permanently dead. The
+        single project every open slot shares is the answer for them, and it is
+        the same one create resolves — so the round trip closes."""
+        proj = tmp_path / "only"
+        proj.mkdir()
+        _user_prompt(proj, "shared-local")
+        state = _slot_state(slots={"slot-a": proj, "slot-b": proj})
+
+        for key in ("", "dashboard:ui"):
+            names = [
+                p["name"]
+                for p in json.loads(
+                    asyncio.run(api_prompts(_list_request(session_key=key, state=state))).body
+                )
+            ]
+            assert "shared-local" in names, f"local scope went dark for session_key={key!r}"
+
+        # …and a create from the same slotless surface lands in that project,
+        # which is what makes list and create agree there.
+        req = _create_request({"name": "made-here", "content": "x", "scope": "local"})
+        req.headers = {}
+        req.app = {"state": state}
+        assert asyncio.run(api_prompts_create(req)).status == 201
+        assert (proj / ".kiro" / "prompts" / "made-here.md").is_file()
+
+    def test_a_named_slot_with_no_project_gets_no_neighbours_project(self, tmp_path, mock_sel):
+        """The shared-project fallback is for SLOTLESS surfaces only. A request
+        that names a real chat is speaking for that chat, and ``chat_runner``
+        would match nothing for a chat with no project — so this surface must
+        say the same, not offer the project a neighbouring chat happens to hold.
+        Otherwise the tab would list a local prompt the chat cannot expand, and a
+        local write from it would land in the neighbour's checkout."""
+        proj = tmp_path / "neighbour"
+        proj.mkdir()
+        _user_prompt(proj, "neighbours-local")
+        # "bare" exists but is bound to no project; "bound" holds the only project.
+        state = _slot_state(slots={"bare": "", "bound": proj})
+
+        names = [
+            p["name"]
+            for p in json.loads(
+                asyncio.run(api_prompts(_list_request(session_key="bare", state=state))).body
+            )
+        ]
+        assert "neighbours-local" not in names
+
+        req = _create_request({"name": "leaked", "content": "x", "scope": "local"})
+        req.headers = {"X-Session-Key": "bare"}
+        req.app = {"state": state}
+        resp = asyncio.run(api_prompts_create(req))
+        assert resp.status == 400
+        assert json.loads(resp.body)["code"] == "no_active_project"
+        assert not (proj / ".kiro" / "prompts" / "leaked.md").exists()
+
+    def test_slotless_local_create_refuses_when_slots_disagree(self, tmp_path, mock_sel):
+        """Fail closed, not first-slot-wins: with two chats on different projects
+        a slotless write has no defensible target, and guessing would create the
+        file in the wrong checkout. The caller gets the existing
+        ``no_active_project`` contract instead."""
+        proj_a = tmp_path / "dis-a"
+        proj_a.mkdir()
+        proj_b = tmp_path / "dis-b"
+        proj_b.mkdir()
+        req = _create_request({"name": "ambiguous", "content": "x", "scope": "local"})
+        req.headers = {}
+        req.app = {"state": _slot_state(slots={"slot-a": proj_a, "slot-b": proj_b})}
+        resp = asyncio.run(api_prompts_create(req))
+        assert resp.status == 400
+        assert json.loads(resp.body)["code"] == "no_active_project"
+        assert not (proj_a / ".kiro" / "prompts" / "ambiguous.md").exists()
+        assert not (proj_b / ".kiro" / "prompts" / "ambiguous.md").exists()
 
     @pytest.mark.parametrize(
         "raw,expected",
@@ -1158,24 +1411,33 @@ class TestScopedPromptDetail:
     """A read addressed like a write, so the editor is seeded from the bytes a
     following PUT would replace."""
 
-    def _scoped(self, name, scope):
+    def _scoped(self, name, scope, project=None):
         r = MagicMock()
         r.method = "GET"
         r.match_info = {"name": name}
         r.query = {"scope": scope}
-        return r
+        # A scoped "local" read resolves its project through
+        # _prompt_local_project(request, state, session_key): carry a real _slots
+        # state, the X-Session-Key header, and the dashboard claim, and bind the
+        # slot to *project* when one is given.
+        r.headers = {"X-Session-Key": _SLOT_KEY}
+        r.app = {"state": _slot_state(project)}
+        return _claim_store(r)
 
-    def test_same_stem_in_both_scopes_resolves_by_scope(self, tmp_path, monkeypatch, mock_sel):
+    def test_same_stem_in_both_scopes_resolves_by_scope(self, tmp_path, mock_sel):
         """Unscoped resolution is first-match, so a shared stem is ambiguous — and
         an editor seeded from the wrong one would save under the other's scope."""
         _user_prompt(tmp_path, "dup", "GLOBAL BODY")
         proj = tmp_path / "proj"
         (proj / ".kiro" / "prompts").mkdir(parents=True)
         (proj / ".kiro" / "prompts" / "dup.md").write_text("LOCAL BODY")
-        monkeypatch.setattr("kiro_crew.agent._project_dir", lambda: proj)
 
+        # The local project now comes from the request's chat slot (per-slot);
+        # bind it via project= rather than the gateway-global _project_dir().
         g = json.loads(asyncio.run(api_prompt_detail(self._scoped("dup", "global"))).body)
-        loc = json.loads(asyncio.run(api_prompt_detail(self._scoped("dup", "local"))).body)
+        loc = json.loads(
+            asyncio.run(api_prompt_detail(self._scoped("dup", "local", project=proj))).body
+        )
         assert g["content"] == "GLOBAL BODY" and g["source"] == "global"
         assert loc["content"] == "LOCAL BODY" and loc["source"] == "local"
 
@@ -1917,6 +2179,150 @@ class TestAppTokenWriteGate:
         assert resp.status == 201
 
 
+class TestAppTokenLocalPromptIsolation:
+    """An app token may READ prompts, so the header it sends must not let it pick
+    which project's local prompts to read.
+
+    App-token grants are path-only: an app permitted to reach ``/api/prompts``
+    supplies its own ``X-Session-Key``, and a resolver that honours any slot would
+    turn the endpoint into a content oracle for another slot's checkout — prompt
+    names, descriptions, and (through the detail lookup) bodies. The app is
+    narrowed to a slot it owns rather than refused outright, because the same
+    response also carries package SOPs and global prompts, which are not
+    slot-scoped and its grant does cover.
+    """
+
+    @staticmethod
+    def _two_slots(owned_project, foreign_project):
+        state = _slot_state(slots={"owned": owned_project, "foreign": foreign_project})
+        state._slots["owned"]._app = "app-A"
+        state._slots["foreign"]._app = "app-B"
+        return state
+
+    def test_app_cannot_list_a_foreign_slots_local_prompts(self, tmp_path, mock_sel):
+        owned = tmp_path / "owned"
+        owned.mkdir()
+        foreign = tmp_path / "foreign"
+        foreign.mkdir()
+        _user_prompt(owned, "mine")
+        _user_prompt(foreign, "theirs")
+        _user_prompt(tmp_path, "everyones")  # ~/.kiro/prompts — not slot-scoped
+        state = self._two_slots(owned, foreign)
+
+        names = [
+            p["name"]
+            for p in json.loads(
+                asyncio.run(
+                    api_prompts(_list_request(session_key="foreign", state=state, app="app-A"))
+                ).body
+            )
+        ]
+        assert "theirs" not in names, "app-A read app-B's slot project"
+        assert "mine" not in names, "a foreign key must not fall back to the app's own slot"
+        # The grant it does hold is intact: global prompts still answer.
+        assert "everyones" in names
+
+    def test_app_reads_its_own_slots_local_prompts(self, tmp_path, mock_sel):
+        """The narrowing is targeted, not a blanket revocation of local reads."""
+        owned = tmp_path / "owned"
+        owned.mkdir()
+        foreign = tmp_path / "foreign"
+        foreign.mkdir()
+        _user_prompt(owned, "mine")
+        _user_prompt(foreign, "theirs")
+        state = self._two_slots(owned, foreign)
+
+        names = [
+            p["name"]
+            for p in json.loads(
+                asyncio.run(
+                    api_prompts(_list_request(session_key="owned", state=state, app="app-A"))
+                ).body
+            )
+        ]
+        assert "mine" in names
+        assert "theirs" not in names
+
+    def test_app_gets_no_shared_project_fallback(self, tmp_path, mock_sel):
+        """The dashboard's "single project every slot shares" step must not apply
+        to an app: it would hand over a local project with no header at all."""
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        _user_prompt(shared, "shared-local")
+        state = _slot_state(slots={"slot-a": shared, "slot-b": shared})
+
+        names = [
+            p["name"]
+            for p in json.loads(
+                asyncio.run(
+                    api_prompts(_list_request(session_key="", state=state, app="appX"))
+                ).body
+            )
+        ]
+        assert "shared-local" not in names
+        # Same state, dashboard claim: the fallback DOES apply, so this test is
+        # pinning the app branch and not an unreachable code path.
+        dash = [
+            p["name"]
+            for p in json.loads(
+                asyncio.run(api_prompts(_list_request(session_key="", state=state))).body
+            )
+        ]
+        assert "shared-local" in dash
+
+    def test_app_cannot_resolve_a_foreign_local_prompt_by_name(self, tmp_path, mock_sel):
+        """The unscoped detail lookup is the oracle that would leak CONTENT, not
+        just a name, so it must narrow through the same seam as the lister."""
+        owned = tmp_path / "owned"
+        owned.mkdir()
+        foreign = tmp_path / "foreign"
+        foreign.mkdir()
+        _user_prompt(foreign, "secret-sop", "CONFIDENTIAL BODY")
+        state = self._two_slots(owned, foreign)
+
+        resp = asyncio.run(
+            api_prompt_detail(
+                _api_request("secret-sop", session_key="foreign", state=state, app="app-A")
+            )
+        )
+        assert resp.status == 404
+        assert b"CONFIDENTIAL" not in resp.body
+
+    def test_refused_slot_selection_is_audited(self, tmp_path, mock_sel):
+        """A forged key from an app leaves an attributable line, so probing is
+        visible rather than silent."""
+        owned = tmp_path / "owned"
+        owned.mkdir()
+        foreign = tmp_path / "foreign"
+        foreign.mkdir()
+        state = self._two_slots(owned, foreign)
+        asyncio.run(api_prompts(_list_request(session_key="foreign", state=state, app="app-A")))
+        denials = [
+            c.kwargs
+            for c in mock_sel.log_api_access.call_args_list
+            if c.kwargs.get("outcome") == "denied"
+        ]
+        assert denials, "a refused app slot selection was not audited"
+        assert denials[0]["caller"] == "app-A"
+        assert denials[0]["source"] == "app_isolation"
+
+    def test_an_unwritable_sel_still_narrows_the_answer(self, tmp_path, mock_sel):
+        """The audit is best-effort; the isolation is not. SEL failing must not
+        turn the narrowing into a 500 — nor into a leak."""
+        mock_sel.log_api_access.side_effect = RuntimeError("SEL unwritable")
+        owned = tmp_path / "owned"
+        owned.mkdir()
+        foreign = tmp_path / "foreign"
+        foreign.mkdir()
+        _user_prompt(foreign, "theirs")
+        state = self._two_slots(owned, foreign)
+        resp = asyncio.run(
+            api_prompts(_list_request(session_key="foreign", state=state, app="app-A"))
+        )
+        assert resp.status == 200
+        assert "theirs" not in [p["name"] for p in json.loads(resp.body)]
+
+
 class TestNonOwnerWriteGate:
     """Prompt mutations require the CONFIGURED OWNER, not any dashboard user.
 
@@ -1992,32 +2398,33 @@ class TestLocalScopeStaysInProject:
     that resolves outside the resolved project root.
     """
 
-    def test_project_kiro_linked_to_home_cannot_delete_global(
-        self, tmp_path, mock_sel, monkeypatch
-    ):
+    def test_project_kiro_linked_to_home_cannot_delete_global(self, tmp_path, mock_sel):
         _user_prompt(tmp_path, "victim", "global body")
         proj = tmp_path / "checkout"
         proj.mkdir()
         (proj / ".kiro").symlink_to(tmp_path / ".kiro", target_is_directory=True)
-        monkeypatch.setattr("kiro_crew.agent._project_dir", lambda: proj)
-        resp = asyncio.run(api_prompt_detail(_write_request("DELETE", "victim", scope="local")))
+        # The project comes from the request's chat slot now (per-slot); bind it.
+        resp = asyncio.run(
+            api_prompt_detail(_write_request("DELETE", "victim", scope="local", project=proj))
+        )
         assert resp.status == 403
         assert json.loads(resp.body)["code"] == "linked_prompt_root"
         assert (tmp_path / ".kiro" / "prompts" / "victim.md").exists()
 
-    def test_project_kiro_linked_to_home_cannot_create(self, tmp_path, mock_sel, monkeypatch):
+    def test_project_kiro_linked_to_home_cannot_create(self, tmp_path, mock_sel):
         proj = tmp_path / "checkout"
         proj.mkdir()
         (proj / ".kiro").symlink_to(tmp_path / ".kiro", target_is_directory=True)
-        monkeypatch.setattr("kiro_crew.agent._project_dir", lambda: proj)
         resp = asyncio.run(
-            api_prompts_create(_create_request({"name": "x", "content": "b", "scope": "local"}))
+            api_prompts_create(
+                _create_request({"name": "x", "content": "b", "scope": "local"}, project=proj)
+            )
         )
         assert resp.status == 403
         assert json.loads(resp.body)["code"] == "linked_prompt_root"
         assert not (tmp_path / ".kiro" / "prompts" / "x.md").exists()
 
-    def test_symlinked_project_root_itself_still_works(self, tmp_path, mock_sel, monkeypatch):
+    def test_symlinked_project_root_itself_still_works(self, tmp_path, mock_sel):
         """Resolved-to-resolved comparison: a project the user reaches THROUGH a
         link is a location the user chose, and must keep working — this pins
         the design against the over-strict unresolved comparison."""
@@ -2025,9 +2432,10 @@ class TestLocalScopeStaysInProject:
         real.mkdir()
         link = tmp_path / "link-checkout"
         link.symlink_to(real, target_is_directory=True)
-        monkeypatch.setattr("kiro_crew.agent._project_dir", lambda: link)
         resp = asyncio.run(
-            api_prompts_create(_create_request({"name": "ok", "content": "b", "scope": "local"}))
+            api_prompts_create(
+                _create_request({"name": "ok", "content": "b", "scope": "local"}, project=link)
+            )
         )
         assert resp.status == 201
         assert (real / ".kiro" / "prompts" / "ok.md").exists()
