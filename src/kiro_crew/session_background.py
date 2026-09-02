@@ -272,7 +272,7 @@ class BackgroundSessionRuntime:
                     # crash at the next boot.
                     if self._owner._sessions.get(background_key) is sess:
                         del self._owner._sessions[background_key]
-                    discard_session_start(background_key)
+                    await discard_session_start(background_key)
                     raise
                 logger.info("Background session created")
                 return
@@ -642,7 +642,7 @@ class BackgroundSessionRuntime:
                 # removal here does not merely lose a sample: the start crumb
                 # survives and the next boot reports this cleanly recycled
                 # session as crashed.
-                record_session_ended(heartbeat_key, end_reason=END_REASON_RECYCLED)
+                await record_session_ended(heartbeat_key, end_reason=END_REASON_RECYCLED)
         if old:
             await old.provider.shutdown()
 

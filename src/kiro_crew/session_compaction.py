@@ -387,7 +387,7 @@ class CompactionCoordinator:
                     # Same tick as the pop. Only this branch records: on the
                     # other one the registry already holds a SUCCESSOR under
                     # this key, whose start must stay its own.
-                    record_session_ended(key, end_reason=END_REASON_RECYCLED)
+                    await record_session_ended(key, end_reason=END_REASON_RECYCLED)
 
             await asyncio.to_thread(self._deps.unlink_session_queue, session)
             if popped is None:

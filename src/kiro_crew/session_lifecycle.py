@@ -29,6 +29,7 @@ from kiro_crew.metrics.sessions import (
     END_REASON_SHUTDOWN,
     END_REASON_UNCLAIMED,
     record_session_ended,
+    record_sessions_ended,
 )
 
 CancelOutcome = Literal["acked", "timeout", "no_turn", "error"]
@@ -337,9 +338,12 @@ class SessionLifecycleService:
                 owner._sessions.clear()
                 # Same tick as the clear. This removal had no end record, so a
                 # replacement under a reused key inherited the old start and
-                # reported a lifetime spanning two sessions.
-                for stale_key, _stale_sess in stale:
-                    record_session_ended(stale_key, end_reason=END_REASON_RETIRED)
+                # reported a lifetime spanning two sessions. Recorded as one set,
+                # so the awaited unlink cannot be cancelled between two keys and
+                # leave the rest behind as fabricated crashes.
+                await record_sessions_ended(
+                    [stale_key for stale_key, _ in stale], end_reason=END_REASON_RETIRED
+                )
         # Shutdown remains outside both locks. Queue unlinking and companion
         # runtime release are intentionally not added to this historical path.
         for key, sess in stale:
@@ -390,12 +394,18 @@ class SessionLifecycleService:
                 # call below documents: the awaits further down let a racing cold
                 # start register a SUCCESSOR under this key, and recording the
                 # end after them would consume the successor's start instead of
-                # this session's. Non-blocking by design (an in-memory pop plus
-                # an in-memory histogram record), so it is safe under the lock.
-                record_session_ended(key, end_reason=END_REASON_RESET)
+                # this session's. The pop and the sample happen before this call's
+                # own suspension point, so that ordering still holds; only the
+                # crumb unlink is deferred to a worker.
+                await record_session_ended(key, end_reason=END_REASON_RESET)
         if clear_conversation and session is not None:
-            # This stays in the same event-loop tick as the registry pop, so a
-            # racing cold start cannot have published a successor SID yet.
+            # The registry lock, not an absence of suspension points, is what makes
+            # this safe: the end record above awaits, but it awaits while this
+            # coroutine still holds ``owner._lock`` -- the lock a racing cold start
+            # must take to register and map a SUCCESSOR -- so no successor SID can
+            # be published across that suspension. Releasing an ``asyncio.Lock``
+            # wakes its waiter without yielding, so control reaches this line before
+            # any of them runs, and this clear cannot erase a successor's pointer.
             owner._session_map.clear_sid(key)
         if session:
             await asyncio.to_thread(self._deps.get_unlink_session_queue(), session)
@@ -505,7 +515,7 @@ class SessionLifecycleService:
             if session is not None:
                 # Same tick as the pop: see reset for why recording after the
                 # teardown awaits would consume a successor's start.
-                record_session_ended(key, end_reason=END_REASON_REMOVED)
+                await record_session_ended(key, end_reason=END_REASON_REMOVED)
         if session:
             await asyncio.to_thread(self._deps.get_unlink_session_queue(), session)
             await session.provider.shutdown()
@@ -540,6 +550,7 @@ class SessionLifecycleService:
                 async with owner._lock:
                     # Selection and unregistering share one lock hold so a
                     # chosen idle object cannot start a turn before its pop.
+                    retired_keys: list[str] = []
                     for key in list(owner._sessions):
                         sess = owner._sessions[key]
                         if not self._deps.provider_uses_kiro_identity_store(sess.provider):
@@ -552,13 +563,16 @@ class SessionLifecycleService:
                         owner._compact_cooldown_until.pop(key, None)
                         self._suppress_replay.discard(key)
                         self._origin_links.pop(key, None)
-                        # Same tick as the removal, not down in the shutdown loop
-                        # below: that loop awaits, and a replacement session can
-                        # register under this key while it does.
-                        record_session_ended(key, end_reason=END_REASON_RETIRED)
+                        retired_keys.append(key)
                         # Do not clear _compact_pending_verdict: the identity
                         # recycle historically preserves that deferred verdict.
                         doomed.append((key, sess.provider))
+                    # Same lock hold as the removals, not down in the shutdown
+                    # loop below: that loop awaits, and a replacement session can
+                    # register under a retired key while it does. Recorded as one
+                    # set so the awaited unlink cannot be cancelled between two
+                    # keys and leave the rest behind as fabricated crashes.
+                    await record_sessions_ended(retired_keys, end_reason=END_REASON_RETIRED)
             finally:
                 for _ in range(held):
                     owner._start_sem.release()
@@ -671,7 +685,7 @@ class SessionLifecycleService:
             owner._compact_pending_verdict.pop(key, None)
             self._origin_links.pop(key, None)
             # Same tick as the removal: see reset.
-            record_session_ended(key, end_reason=END_REASON_UNCLAIMED)
+            await record_session_ended(key, end_reason=END_REASON_UNCLAIMED)
         await asyncio.to_thread(self._deps.get_unlink_session_queue(), session)
         await session.provider.shutdown()
         await owner.release_subagent_runtime(key)
@@ -701,7 +715,7 @@ class SessionLifecycleService:
             # rely on the historical asymmetry with reset/remove.
             if session is not None:
                 # Same tick as the pop: see reset.
-                record_session_ended(key, end_reason=END_REASON_DESTROYED)
+                await record_session_ended(key, end_reason=END_REASON_DESTROYED)
         try:
             if session:
                 await asyncio.to_thread(self._deps.get_unlink_session_queue(), session)
@@ -758,11 +772,15 @@ class SessionLifecycleService:
             else:
                 self._suppress_replay.add(key)
             if session is not None:
-                # Same tick as the pop, exactly like the clear_sid below.
-                record_session_ended(key, end_reason=END_REASON_DISCARDED)
-        # Same tick as the pop — no await between the two, so a cold start racing
-        # this teardown cannot have registered a replacement sid for the key in
-        # between, and this clear therefore cannot erase a SUCCESSOR's pointer.
+                # Same lock hold as the pop, exactly like the clear_sid below.
+                await record_session_ended(key, end_reason=END_REASON_DISCARDED)
+        # The registry lock, not an absence of suspension points, is what keeps a
+        # cold start racing this teardown from registering a replacement sid for the
+        # key in between, so this clear cannot erase a SUCCESSOR's pointer. The end
+        # record above awaits, but it does so while ``owner._lock`` is still held --
+        # the lock that cold start must take to register and map a successor -- and
+        # releasing an ``asyncio.Lock`` wakes its waiter without yielding, so control
+        # reaches this line before any of them runs.
         # Deferring it past the shutdown awaits below is exactly that bug: the
         # provider shutdown is slow, a concurrent channel turn creates and maps a
         # new session under the same key while it runs, and a clear in the
@@ -974,10 +992,13 @@ class SessionLifecycleService:
             owner._compact_cooldown_until.clear()
             self._suppress_replay.clear()
             owner._compact_pending_verdict.clear()
-            # Same tick as the clear: recording is non-blocking, so the whole
-            # drained set is accounted for before anything can await.
-            for closed_key in sessions:
-                record_session_ended(closed_key, end_reason=END_REASON_SHUTDOWN)
+            # Same lock hold as the clear: the whole drained set is accounted for
+            # in one call, so the awaited unlink cannot be cancelled between two
+            # keys. Per-key awaits would leave every key after the cancellation
+            # popped but unrecorded -- and shutdown is precisely the path a
+            # cancellation reaches, so that would turn one orderly close into a
+            # burst of sessions the next boot reports as crashed.
+            await record_sessions_ended(sessions, end_reason=END_REASON_SHUTDOWN)
 
         # Provider shutdown can enqueue multiple blocking process-maintenance
         # jobs, so keep the original bounded fan-out.
@@ -1162,12 +1183,16 @@ class SessionLifecycleService:
         popped: list[_SessionEntry] = []
         async with owner._lock:
             keys = list(owner._sessions.keys())
+            ended: list[str] = []
             for key in keys:
                 session = owner._sessions.pop(key, None)
                 if session:
                     providers.append(session.provider)
                     popped.append(session)
-                    record_session_ended(key, end_reason=END_REASON_SHUTDOWN)
+                    ended.append(key)
+            # One call for the whole set, so a cancellation cannot land between two
+            # keys and leave the rest of them behind as fabricated crashes.
+            await record_sessions_ended(ended, end_reason=END_REASON_SHUTDOWN)
         # Filesystem unlink stays outside the registry lock.
         for session in popped:
             await asyncio.to_thread(self._deps.get_unlink_session_queue(), session)

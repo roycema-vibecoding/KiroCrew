@@ -9,7 +9,9 @@ production code -- a change there fails these tests instead of passing green.
 import asyncio
 import json
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -65,11 +67,18 @@ def _crumbs(home):
     return sorted(d.glob("*.json")) if d.is_dir() else []
 
 
+_UNLINK_SPELLINGS = ("_unlink(", "_unlink_generations(", "_unlink_all(")
+
+
 def _unlink_is_outside_the_table_lock(src: str) -> bool:
-    """True when no ``_unlink(`` call is nested inside a ``with _live_lock:`` block.
+    """True when no crumb unlink is nested inside a ``with _live_lock:`` block.
 
     Indentation-aware rather than a substring window: the block is the run of
     lines indented deeper than the ``with`` itself, which is what "inside" means.
+
+    Every spelling the module uses is checked, not just the leaf ``_unlink(``: the
+    end paths now hand their paths to ``_unlink_generations``, so a gate that only
+    knew the leaf name would have stopped detecting anything and read as green.
     """
     lines = src.splitlines()
     for i, line in enumerate(lines):
@@ -81,7 +90,7 @@ def _unlink_is_outside_the_table_lock(src: str) -> bool:
                 continue
             if len(follower) - len(follower.lstrip()) <= indent:
                 break  # block ended
-            if "_unlink(" in follower:
+            if any(spelling in follower for spelling in _UNLINK_SPELLINGS):
                 return False
     return True
 
@@ -95,6 +104,26 @@ def _start(key):
     ``asyncio.to_thread`` needs.
     """
     asyncio.run(sess.record_session_started(key))
+
+
+def _end(key, end_reason):
+    """Drive ``record_session_ended`` from a sync test.
+
+    A coroutine for the same reason the start is: the crumb unlink is a filesystem
+    syscall and must not run on the event loop, and awaiting the worker hop is the
+    only shape that takes it off the loop without ever dropping it.
+    """
+    asyncio.run(sess.record_session_ended(key, end_reason=end_reason))
+
+
+def _end_many(keys, end_reason):
+    """Drive the bulk end path -- ``close_all`` and the other mass-teardown pops."""
+    asyncio.run(sess.record_sessions_ended(keys, end_reason=end_reason))
+
+
+def _discard(key):
+    """Drive ``discard_session_start`` -- a rolled-back start, off the loop."""
+    asyncio.run(sess.discard_session_start(key))
 
 
 def _write_crumb(home, key, started_at, *, owner_pid=None):
@@ -192,13 +221,331 @@ class TestEnd:
     def test_end_emits_the_lifetime_and_consumes_the_crumb(self, home, rec):
         self._start("dashboard:chat-1", 60)
         assert _crumbs(home), "the start must have left a crumb to consume"
-        sess.record_session_ended("dashboard:chat-1", end_reason=sess.END_REASON_RESET)
+        _end("dashboard:chat-1", sess.END_REASON_RESET)
         calls = _duration_calls(rec)
         assert len(calls) == 1
         assert calls[0]["unit"] == "ms"
         assert 55_000 < calls[0]["value"] < 70_000
         assert calls[0]["attrs"] == {"end_reason": "reset", "session_source": "dashboard"}
         assert _crumbs(home) == [], "the end must consume the crumb"
+
+    def test_no_crumb_unlink_runs_on_the_event_loop(self, home, rec, monkeypatch):
+        """#7537: one ``unlink`` against a slow data home parked every gateway task.
+
+        Teardown runs on the paths a person is waiting on -- closing a tab,
+        resetting a slot, shutting the gateway down -- so a stalled syscall there is
+        felt as the whole gateway freezing rather than as a metrics problem. Driven
+        rather than read off the source: what matters is which THREAD ends up
+        holding the syscall, and only running all three end paths can show that.
+        """
+        threads: list[int] = []
+        real = sess._unlink_all
+
+        def _spy(paths):
+            threads.append(threading.get_ident())
+            real(paths)
+
+        monkeypatch.setattr(sess, "_unlink_all", _spy)
+
+        async def _drive():
+            await sess.record_session_started("dashboard:chat-1")
+            await sess.record_session_ended("dashboard:chat-1", end_reason=sess.END_REASON_RESET)
+            await sess.record_session_started("dashboard:chat-2")
+            await sess.record_sessions_ended(
+                ["dashboard:chat-2"], end_reason=sess.END_REASON_SHUTDOWN
+            )
+            await sess.record_session_started("dashboard:chat-3")
+            await sess.discard_session_start("dashboard:chat-3")
+            return threading.get_ident()
+
+        loop_thread = asyncio.run(_drive())
+        assert len(threads) == 3, "each end path must reach the unlink exactly once"
+        assert loop_thread not in threads, (
+            "a crumb unlink ran on the event-loop thread, so a slow data home "
+            "stalls every gateway task behind one session teardown"
+        )
+        assert _crumbs(home) == [], "every path must still consume its own crumb"
+
+    def test_the_bulk_end_unlinks_the_whole_drained_set_in_one_hop(self, home, rec, monkeypatch):
+        """A hop per key would put a cancellation point BETWEEN two keys.
+
+        Every key after such a cancellation is popped but unrecorded, so its crumb
+        survives and the next boot reports it as ``crashed``. On ``close_all`` -- a
+        path cancellation reaches by design -- that turns one orderly shutdown into
+        a burst of fabricated failures, which is worse than the on-loop unlink the
+        await replaced. Counting hops rather than racing a real cancellation makes
+        the discriminator deterministic: a per-key loop yields ``[1, 1, 1, 1, 1]``.
+        """
+        hops: list[int] = []
+        real = sess._unlink_all
+
+        def _spy(paths):
+            hops.append(len(paths))
+            real(paths)
+
+        monkeypatch.setattr(sess, "_unlink_all", _spy)
+        keys = [f"dashboard:chat-{i}" for i in range(1, 6)]
+        for key in keys:
+            self._start(key, 60)
+        assert len(_crumbs(home)) == 5
+        _end_many(keys, sess.END_REASON_SHUTDOWN)
+        assert hops == [5], "the drained set must be consumed in one worker hop"
+        assert _crumbs(home) == [], "the whole set must be consumed"
+        calls = _duration_calls(rec)
+        assert len(calls) == 5
+        assert {c["attrs"]["end_reason"] for c in calls} == {"shutdown"}
+
+    def test_the_bulk_end_pops_the_whole_set_under_one_lock_hold(self):
+        """The pops must not be separable, or a cancellation splits the set."""
+        import inspect
+
+        src = inspect.getsource(sess.record_sessions_ended)
+        body = src.split('"""', 2)[-1]
+        assert body.count("with _live_lock:") == 1, "one hold, or the set is splittable"
+        assert body.count("await ") == 1, "exactly one suspension point, after every pop"
+        assert body.index("with _live_lock:") < body.index(
+            "await "
+        ), "every pop must happen before the only cancellable point"
+
+    def test_a_cancelled_end_keeps_its_sample_and_still_consumes_the_crumb(
+        self, home, rec, monkeypatch
+    ):
+        """A cancellation must cost neither the sample nor the crumb.
+
+        The sample is emitted before the hop, so it is already recorded. The crumb
+        is consumed either by the worker (this case, where a thread has picked the
+        item up) or inline by ``_unlink_generations``' fallback (the queued case, in
+        the test below).
+
+        The worker is held on an event until after the cancel lands, because a bare
+        ``unlink`` can finish first and then the task would be cancelled at its
+        return instead of at its await -- a passing test that never exercised the
+        window.
+        """
+        self._start("dashboard:chat-1", 60)
+        released = threading.Event()
+        real = sess._unlink_all
+
+        def _held(paths):
+            assert released.wait(10), "the test never released the crumb worker"
+            real(paths)
+
+        monkeypatch.setattr(sess, "_unlink_all", _held)
+
+        async def _drive():
+            task = asyncio.create_task(
+                sess.record_session_ended("dashboard:chat-1", end_reason=sess.END_REASON_RESET)
+            )
+            # One step is enough to reach the executor submit inside to_thread, and
+            # the worker cannot resolve the future while it waits on the event.
+            await asyncio.sleep(0)
+            task.cancel()
+            released.set()
+            try:
+                await task
+            except asyncio.CancelledError:
+                return "raised"
+            return "absorbed"
+
+        assert asyncio.run(_drive()) == "absorbed", (
+            "the end must not hand its caller an abort point between the registry "
+            "pop and the caller's own post-pop cleanup"
+        )
+        # asyncio.run() shuts the default executor down on the way out, which joins
+        # the worker -- so the unlink has landed by the time this returns.
+        assert _crumbs(home) == [], (
+            "a cancelled end left its crumb behind, so the next boot reports this "
+            "cleanly ended session as crashed"
+        )
+        assert len(_duration_calls(rec)) == 1, "the sample must survive the cancellation"
+
+    def test_a_cancelled_end_lets_its_callers_post_pop_cleanup_run(self, home, rec, monkeypatch):
+        """GPT round 1 on PR #7809, against ``session_lifecycle.destroy``.
+
+        ``destroy`` pops the registry and records the end INSIDE the registry lock,
+        then opens a ``try`` whose ``finally`` deletes the session-map entry. An end
+        that raised would exit ``destroy`` before that ``try`` was ever entered, so a
+        permanently destroyed session would keep its mapping and could be resumed at
+        the next boot -- a window the synchronous version did not have, because it
+        had no suspension point there at all.
+
+        Reproduces that control flow rather than standing up the lifecycle service
+        (whose stubs this file deliberately avoids): the mandatory cleanup sits in a
+        ``finally`` BELOW the end call, exactly where ``destroy`` has it.
+        """
+        self._start("dashboard:chat-1", 60)
+        released = threading.Event()
+        real = sess._unlink_all
+
+        def _held(paths):
+            assert released.wait(10), "the test never released the crumb worker"
+            real(paths)
+
+        monkeypatch.setattr(sess, "_unlink_all", _held)
+        cleaned: list[str] = []
+
+        async def _destroy_shaped():
+            # The lock-held pop plus end record, where destroy() has them.
+            await sess.record_session_ended(
+                "dashboard:chat-1", end_reason=sess.END_REASON_DESTROYED
+            )
+            # The try/finally destroy() opens AFTER that block.
+            try:
+                await asyncio.sleep(0)
+            finally:
+                cleaned.append("session-map delete")
+
+        async def _drive():
+            task = asyncio.create_task(_destroy_shaped())
+            await asyncio.sleep(0)
+            task.cancel()
+            released.set()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(_drive())
+        assert cleaned == ["session-map delete"], (
+            "a cancellation at the crumb hop skipped the caller's mandatory "
+            "post-pop cleanup, so a destroyed session keeps its map entry"
+        )
+        assert _crumbs(home) == [], "and the crumb must still be consumed"
+
+    def test_a_cancelled_end_consumes_its_crumb_even_when_the_hop_never_started(self, home, rec):
+        """GPT round 2 on PR #7809: submitted is not started.
+
+        ``asyncio.to_thread`` hands the work to the default executor and suspends,
+        but on a saturated pool the item is still QUEUED. Cancelling the await
+        propagates through ``wrap_future`` to the underlying
+        ``concurrent.futures.Future``, and cancelling a work item that has not begun
+        drops it outright -- so the crumb of a cleanly ended session survives to the
+        next boot and is back-filled as ``crashed``. That is the same
+        dropped-unlink failure that ruled out the maintenance pool, reached by a
+        different queue.
+
+        Pins the queued case specifically: the executor is replaced with a
+        single-worker pool whose one thread is occupied, so the hop provably cannot
+        have started when the cancel lands.
+        """
+        self._start("dashboard:chat-1", 60)
+        occupied = threading.Event()
+        release = threading.Event()
+
+        def _hog():
+            occupied.set()
+            assert release.wait(10), "the test never released the pool's only worker"
+
+        async def _drive():
+            loop = asyncio.get_running_loop()
+            pool = ThreadPoolExecutor(max_workers=1)
+            loop.set_default_executor(pool)
+            hog = loop.run_in_executor(None, _hog)
+            assert occupied.wait(5), "the pool's only worker never started"
+            task = asyncio.create_task(
+                sess.record_session_ended("dashboard:chat-1", end_reason=sess.END_REASON_SHUTDOWN)
+            )
+            # One step reaches the submit inside to_thread. The single worker is
+            # busy, so the item is queued and cannot have started.
+            await asyncio.sleep(0)
+            task.cancel()
+            outcome = "absorbed"
+            try:
+                await task
+            except asyncio.CancelledError:
+                outcome = "raised"
+            release.set()
+            await hog
+            pool.shutdown(wait=True)
+            return outcome
+
+        assert asyncio.run(_drive()) == "absorbed"
+        assert _crumbs(home) == [], (
+            "the hop was cancelled before any thread picked it up, so the crumb was "
+            "never consumed and the next boot reports this clean shutdown as a crash"
+        )
+        assert len(_duration_calls(rec)) == 1, "the sample must survive the cancellation"
+
+    def test_the_hop_is_shielded_and_never_becomes_a_task(self):
+        """Round 3 settled this line; both halves of the shape are load-bearing.
+
+        Shielded, so a cancellation cannot reach the queued work item and drop it
+        (round 2), and never unlinked inline, so a cancellation cannot put the
+        syscall back on the event loop (round 3). A BARE future rather than a
+        shielded ``to_thread`` coroutine, because ``shield`` would wrap a coroutine
+        in a Task and ``_cancel_all_tasks`` at loop teardown would cancel it,
+        dropping a still-queued item after all.
+        """
+        import inspect
+
+        hop = inspect.getsource(sess._unlink_generations)
+        body = hop.split('"""', 2)[-1]
+        assert "run_in_executor(" in body, "the hop must be a bare future, not a Task"
+        assert "asyncio.shield(" in body, "a cancellation must not reach the queued item"
+        assert "to_thread(" not in body, "shield would wrap a coroutine in a cancellable Task"
+        assert (
+            "_unlink_all(paths)" not in body
+        ), "the unlink must never run on the event loop, which is what #7537 is about"
+
+    def test_no_end_path_hands_its_caller_a_new_abort_point(self):
+        """All three absorb; the helper owns not-dropping the unlink.
+
+        Two distinct guarantees, deliberately in two places. Whether a caller may be
+        aborted is knowable only where its post-pop cleanup is known, so it lives in
+        the end paths. Whether the unlink survives a cancelled hop is a property of
+        the hop, so it lives in the helper.
+        """
+        import inspect
+
+        for fn in (
+            sess.record_session_ended,
+            sess.record_sessions_ended,
+            sess.discard_session_start,
+        ):
+            body = inspect.getsource(fn).split('"""', 2)[-1]
+            assert "except BaseException" in body, (
+                f"{fn.__name__} must absorb a cancellation at the crumb hop, or its "
+                "caller exits before its own post-pop cleanup"
+            )
+        helper = inspect.getsource(sess._unlink_generations).split('"""', 2)[-1]
+        assert "asyncio.shield(" in helper, (
+            "the helper owns the other half: a cancelled hop must still consume the "
+            "crumb, which an end path cannot do for it"
+        )
+
+    def test_a_cancelled_discard_does_not_displace_the_rollback_failure(
+        self, home, rec, monkeypatch
+    ):
+        """Its callers re-raise the failure that started the rollback on the next line.
+
+        A cancellation escaping here would replace that failure with one of this
+        function's own making, so the discard absorbs it -- and the crumb is still
+        consumed, because ``_unlink_generations`` never drops the unlink.
+        """
+        self._start("dashboard:chat-1", 60)
+        released = threading.Event()
+        real = sess._unlink_all
+
+        def _held(paths):
+            assert released.wait(10), "the test never released the crumb worker"
+            real(paths)
+
+        monkeypatch.setattr(sess, "_unlink_all", _held)
+
+        async def _drive():
+            task = asyncio.create_task(sess.discard_session_start("dashboard:chat-1"))
+            await asyncio.sleep(0)
+            task.cancel()
+            released.set()
+            try:
+                await task
+            except asyncio.CancelledError:
+                return "raised"
+            return "absorbed"
+
+        assert asyncio.run(_drive()) == "absorbed"
+        assert _crumbs(home) == [], "a rolled-back start must not leave a crumb"
+        assert not _duration_calls(rec), "a session that never lived has no lifetime"
 
     def test_the_end_record_touches_no_disk(self):
         """It runs in the same tick as the registry pop, so it cannot block.
@@ -217,18 +564,18 @@ class TestEnd:
     def test_a_second_end_emits_nothing(self, home, rec):
         """The teardown paths overlap -- the idle sweep calls reset."""
         self._start("dashboard:chat-1", 60)
-        sess.record_session_ended("dashboard:chat-1", end_reason=sess.END_REASON_RESET)
-        sess.record_session_ended("dashboard:chat-1", end_reason=sess.END_REASON_SHUTDOWN)
+        _end("dashboard:chat-1", sess.END_REASON_RESET)
+        _end("dashboard:chat-1", sess.END_REASON_SHUTDOWN)
         assert len(_duration_calls(rec)) == 1
 
     def test_end_without_a_crumb_emits_nothing(self, home, rec):
-        sess.record_session_ended("dashboard:never-started", end_reason=sess.END_REASON_RESET)
+        _end("dashboard:never-started", sess.END_REASON_RESET)
         assert not _duration_calls(rec)
 
     def test_unknown_end_reason_is_refused(self, home, rec):
         """An unbounded label would mint a series; the enum is the gate."""
         _write_crumb(home, "dashboard:chat-1", time.time() - 60)
-        sess.record_session_ended("dashboard:chat-1", end_reason="whatever-i-like")
+        _end("dashboard:chat-1", "whatever-i-like")
         assert not _duration_calls(rec)
         assert _crumbs(home), "a refused reason must not consume the crumb"
 
@@ -237,7 +584,7 @@ class TestEnd:
         # rejected there. Planting only a crumb would return early at the pop and
         # pass without ever exercising the guard.
         self._start("dashboard:chat-1", -3600)
-        sess.record_session_ended("dashboard:chat-1", end_reason=sess.END_REASON_RESET)
+        _end("dashboard:chat-1", sess.END_REASON_RESET)
         assert not _duration_calls(rec)
 
 
@@ -293,7 +640,7 @@ class TestCrashedBackfill:
         sess._write_crumb("dashboard:chat-1", started)
         assert _crumbs(home), "the start must have left a crumb to consume"
         self._transcript(home, "dashboard:chat-1", started + 3600)
-        sess.record_session_ended("dashboard:chat-1", end_reason=sess.END_REASON_SHUTDOWN)
+        _end("dashboard:chat-1", sess.END_REASON_SHUTDOWN)
         assert _crumbs(home) == [], "the end must consume the crumb"
         assert sess.backfill_crashed_sessions() == 0
         calls = _duration_calls(rec)
@@ -331,7 +678,7 @@ class TestWriterSelfCorrection:
         started = time.time()
         with sess._live_lock:
             sess._live_starts["dashboard:chat-1"] = started
-        sess.discard_session_start("dashboard:chat-1")
+        _discard("dashboard:chat-1")
         # The worker runs LATE, after the rollback already cleaned up.
         sess._write_crumb("dashboard:chat-1", started)
         assert not _crumbs(home), "a crumb written after a discard would backfill as crashed"
@@ -419,7 +766,12 @@ class TestWriterSelfCorrection:
         """
         import inspect
 
-        for name in ("record_session_ended", "discard_session_start", "_write_crumb"):
+        for name in (
+            "record_session_ended",
+            "record_sessions_ended",
+            "discard_session_start",
+            "_write_crumb",
+        ):
             src = inspect.getsource(getattr(sess, name))
             body = src.split('"""', 2)[-1] if '"""' in src else src
             io_at = body.find("with _crumb_io_lock")
@@ -626,13 +978,13 @@ class TestReviewFixes:
         # And the end consumes whatever the start left.
         _start("dashboard:chat-1")
         assert _crumbs(home)
-        sess.record_session_ended("dashboard:chat-1", end_reason=sess.END_REASON_RESET)
+        _end("dashboard:chat-1", sess.END_REASON_RESET)
         assert not _crumbs(home)
         assert sess.backfill_crashed_sessions() == 0
 
     def test_a_later_session_under_the_same_key_still_gets_a_crumb(self, home, rec):
         """An ended key must not be suppressed for the rest of the process."""
-        sess.record_session_ended("dashboard:chat-1", end_reason=sess.END_REASON_RESET)
+        _end("dashboard:chat-1", sess.END_REASON_RESET)
         _start("dashboard:chat-1")
         assert len(_crumbs(home)) == 1
 
@@ -658,20 +1010,46 @@ class TestReviewFixes:
         assert len(crumbs) == 1, "one key is one crumb, whatever the generation"
         assert json.loads(crumbs[0].read_text())["started_at"] == current
 
-    def test_the_end_unlinks_inline_so_the_unlink_cannot_be_cancelled(self):
-        """Review round 4: a pooled unlink was wrong in both directions.
+    def test_the_end_unlinks_off_the_loop_without_ever_dropping_the_unlink(self):
+        """Review round 4 rejected a POOLED unlink; #7537 rejected an inline one.
 
-        Queued, it can land after a successor wrote its own crumb and delete it,
-        losing that session's later crash. And ``shutdown_maintenance_executor``
-        drains with ``cancel_futures=True``, so at ``close_all`` -- when the pool
-        is flooded with teardown work -- the unlink is dropped entirely, leaving
-        a cleanly ended session's crumb for the next boot to call ``crashed``.
+        Both rejections stand, and awaiting is the shape that survives both. Queued
+        on the maintenance pool, the unlink is dropped at ``close_all`` --
+        ``shutdown_maintenance_executor`` drains with ``cancel_futures=True``, so a
+        cleanly ended session's crumb is left for the next boot to call
+        ``crashed``. Inline on the event loop, it parks every gateway task behind
+        one closing session whenever the data home is slow or network-backed.
+        Awaiting a worker hop is off the loop AND never dropped.
         """
         import inspect
 
-        body = inspect.getsource(sess.record_session_ended)
-        assert "_submit(" not in body, "the unlink must not be handed to the pool"
-        assert "_unlink(_crumb_path(" in body, "the end must unlink its own generation"
+        for fn in (sess.record_session_ended, sess.record_sessions_ended):
+            body = inspect.getsource(fn)
+            assert "_submit(" not in body, "the unlink must not be handed to the pool"
+            assert "await _unlink_generations(" in body, "the unlink must be awaited off-loop"
+            assert "_unlink(_crumb_path(" not in body, "the unlink must not run on the loop"
+        hop = inspect.getsource(sess._unlink_generations)
+        assert "await asyncio.shield(" in hop, "the hop must be awaited, not fired blind"
+        assert "run_in_executor(" in hop, (
+            "the shielded hop must be a bare future: shielding a to_thread coroutine "
+            "makes it a Task, which loop teardown cancels"
+        )
+        assert not hasattr(sess, "_submit"), "the fire-and-forget pool submitter must stay gone"
+
+    def test_the_discard_also_leaves_the_loop(self):
+        """#7537 named both end paths; a rollback is still a filesystem syscall.
+
+        It absorbs a cancellation, as both end paths do, because its
+        caller re-raises the failure that started the rollback on the next line --
+        so a cancellation escaping here would displace that failure instead of
+        adding information.
+        """
+        import inspect
+
+        body = inspect.getsource(sess.discard_session_start)
+        assert "await _unlink_generations(" in body, "the discard must unlink off-loop"
+        assert "_unlink(_crumb_path(" not in body, "the discard must not unlink on the loop"
+        assert "except BaseException" in body, "the rollback caller's failure must survive"
 
     def test_the_backfill_never_claims_a_crumb_from_this_process(self, home, rec):
         """The cutoff is what lets the scan run off the boot path."""
@@ -867,9 +1245,10 @@ class TestEveryRegistryRemovalRecordsAnEnd:
         removal spellings the tree actually uses -- ``_sessions.pop``, ``del
         _sessions[...]`` and ``_sessions.clear()`` -- so a path that switches
         spelling does not fall out of the gate. A removal consumes its crumb
-        either by recording an end (a session that lived) or by discarding the
-        start (a registration rolled back before it became a session); both leave
-        no crumb behind, which is what the invariant is actually about.
+        either by recording an end (a session that lived, singly or as a drained
+        set) or by discarding the start (a registration rolled back before it
+        became a session); both leave no crumb behind, which is what the invariant
+        is actually about.
         """
         import ast
         import importlib
@@ -878,7 +1257,7 @@ class TestEveryRegistryRemovalRecordsAnEnd:
         module = importlib.import_module(f"kiro_crew.{module_name}")
         tree = ast.parse(inspect.getsource(module))
         out: dict[str, bool] = {}
-        consumers = {"record_session_ended", "discard_session_start"}
+        consumers = {"record_session_ended", "record_sessions_ended", "discard_session_start"}
 
         def _is_registry(node):
             return isinstance(node, ast.Attribute) and node.attr == "_sessions"
@@ -961,11 +1340,18 @@ class TestTeardownPathsAreWired:
 
     @staticmethod
     def _reasons_recorded_by(method_name):
+        """Reasons *method_name* records, whether one key at a time or a whole set.
+
+        Both spellings count: the mass-teardown paths pop many keys under one lock
+        hold and record them with ``record_sessions_ended``, precisely so no
+        cancellation can land between two of them.
+        """
         import ast
         import inspect
 
         from kiro_crew import session_lifecycle
 
+        recorders = {"record_session_ended", "record_sessions_ended"}
         tree = ast.parse(inspect.getsource(session_lifecycle))
         found: list[str] = []
         for node in ast.walk(tree):
@@ -976,7 +1362,7 @@ class TestTeardownPathsAreWired:
                     continue
                 func = call.func
                 name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
-                if name != "record_session_ended":
+                if name not in recorders:
                     continue
                 for kw in call.keywords:
                     if kw.arg == "end_reason" and isinstance(kw.value, ast.Name):

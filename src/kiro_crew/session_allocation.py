@@ -499,7 +499,7 @@ class SessionAllocationService:
                 dead = session.provider
                 # Same tick as the removal. Left unrecorded, the start crumb
                 # survives and the next boot calls this a crash.
-                record_session_ended(key, end_reason=END_REASON_EVICTED)
+                await record_session_ended(key, end_reason=END_REASON_EVICTED)
         if dead is not None:
             await asyncio.to_thread(self._deps.unlink_session_queue, session)
             try:
@@ -585,7 +585,7 @@ class SessionAllocationService:
                     # dying -- and the crumb would outlive it into a false crash.
                     if self._sessions.get(key) is session:
                         del self._sessions[key]
-                    discard_session_start(key)
+                    await discard_session_start(key)
                     raise
         if duplicate is not None:
             try:
@@ -1114,7 +1114,7 @@ class SessionAllocationService:
                             # Same tick as the removal. Left unrecorded, the
                             # start crumb survives and the next boot calls this
                             # a crash rather than an eviction.
-                            record_session_ended(key, end_reason=END_REASON_EVICTED)
+                            await record_session_ended(key, end_reason=END_REASON_EVICTED)
                     if alive:
                         session.last_used = time.monotonic()
                         if (
@@ -1418,7 +1418,7 @@ class SessionAllocationService:
                         # kill, plus a crumb the next boot reads as a crash.
                         if self._sessions.get(key) is session:
                             del self._sessions[key]
-                        discard_session_start(key)
+                        await discard_session_start(key)
                         raise
                     self._deps.logger.info(
                         "New session: %s agent=%s resumed=%s provider_switch=%s (total=%d)",

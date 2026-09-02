@@ -33,12 +33,23 @@ ends because the gateway crashed never runs any teardown path, so it would
 contribute no sample at all and the histogram would describe only orderly
 shutdowns. Each start therefore drops one small JSON file under
 ``<data home>/metrics/open-sessions/``. The clean path does NOT read that file --
-it takes the start time from the in-memory table, so an end can run in the same
-tick as the registry removal it reports -- it only unlinks it. Whatever is still
-there at the next boot belongs to a session that never ended cleanly, so
-:func:`backfill_crashed_sessions` reads it, emits it as ``end_reason=crashed``
-and unlinks it. The crumb is written only while telemetry consent is in force,
-since it exists solely to feed an instrument that is a no-op without it.
+it takes the start time from the in-memory table, so an end can account for
+itself in the same tick as the registry removal it reports -- it only unlinks it.
+Whatever is still there at the next boot belongs to a session that never ended
+cleanly, so :func:`backfill_crashed_sessions` reads it, emits it as
+``end_reason=crashed`` and unlinks it. The crumb is written only while telemetry
+consent is in force, since it exists solely to feed an instrument that is a no-op
+without it.
+
+**No crumb syscall runs on the event loop.** Every path that touches a crumb
+file -- the start's write, the end's unlink, a rolled-back start's discard and
+the boot backfill's scan -- does it on a worker thread. A single ``unlink`` looks
+too small to bother with until the data home is slow or network-backed, at which
+point that one syscall parks every gateway task behind whichever session happens
+to be closing: teardown runs on the paths a person is waiting on (closing a tab,
+resetting a slot, shutting the gateway down), so the stall is felt as the whole
+gateway freezing rather than as a metrics problem. Each hop is AWAITED rather
+than queued, for the reason :func:`_unlink_generations` gives at length.
 
 **Why not the transcript's existing close marker.** A transcript's metadata line
 already carries ``created_at``, and the dashboard tab-close path stamps
@@ -89,6 +100,7 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -194,12 +206,12 @@ _live_starts: dict[str, float] = {}
 # filesystem latency costs a worker and never the gateway's responsiveness --
 # which is the whole reason it is a second lock rather than _live_lock.
 #
-# Nothing on the event loop may take this. The end path does not need to: with
-# ownership recorded in each crumb, the backfill skips every crumb whose owner is
-# live, so a session ending in THIS process and the crumbs the backfill reaps are
-# disjoint sets. It is also worth being explicit that this is a THREAD lock and
-# therefore never protected anything against a sibling PROCESS -- that is what the
-# ownership field is for.
+# Nothing on the event loop may take this. The end path does not need it on either
+# side of its worker hop: with ownership recorded in each crumb, the backfill skips
+# every crumb whose owner is live, so a session ending in THIS process and the
+# crumbs that scan reaps are disjoint sets. It is also worth being explicit that
+# this is a THREAD lock and therefore never protected anything against a sibling
+# PROCESS -- that is what the ownership field is for.
 _crumb_io_lock = threading.Lock()
 
 
@@ -329,7 +341,7 @@ async def record_session_started(session_key: str) -> None:
         logger.debug("session started counter failed", exc_info=True)
 
 
-def discard_session_start(session_key: str) -> None:
+async def discard_session_start(session_key: str) -> None:
     """Undo a start that never became a live session; never raises.
 
     For the cancellation window between registering a session and finishing its
@@ -342,6 +354,22 @@ def discard_session_start(session_key: str) -> None:
     Deliberately not one of the ``end_reason`` values: those describe how a live
     session ENDED, and inventing a twelfth member for "never started" would put a
     non-session into the lifetime histogram's population.
+
+    **Why this is a coroutine, in the one place an await looks least welcome.**
+    Its unlink is the same syscall the end path has, on the same event loop, so it
+    has to leave the loop for the same reason. That it does so inside a rollback
+    handler -- code whose entire job is to guarantee the crumb is consumed -- is
+    safe only because :func:`_unlink_generations` never raises and never drops the
+    unlink: it falls back to unlinking inline when its worker hop is cancelled, so a
+    second cancellation arriving mid-rollback cannot cost the handler its crumb.
+
+    **It absorbs that second cancellation, as both end paths do.** Its caller
+    re-raises the failure which started the rollback on the very next line, so
+    letting a cancellation out here would DISPLACE that failure with one of this
+    function's own making. That is the same rule
+    :func:`record_session_ended` follows for the same underlying reason: every
+    caller of these three has already passed its point of no return, and a
+    cancellation arriving afterwards can only leave the teardown half done.
     """
     if not session_key:
         return
@@ -354,8 +382,11 @@ def discard_session_start(session_key: str) -> None:
         # to prevent -- a discard that cannot name its own generation has no crumb
         # to consume, because it never wrote one.
         return
-    # Outside the lock, for the reason record_session_ended gives.
-    _unlink(_crumb_path(session_key, started_at))
+    # Off the loop and outside the lock, for the reason record_session_ended gives.
+    try:
+        await _unlink_generations(((session_key, started_at),))
+    except BaseException:
+        logger.debug("session start discard interrupted", exc_info=True)
 
 
 def _crumbs_enabled() -> bool:
@@ -515,37 +546,62 @@ def _owner_still_running(pid: object, start_id: object) -> bool:
     return live_start_id == start_id
 
 
-def record_session_ended(session_key: str, *, end_reason: str) -> None:
+async def record_session_ended(session_key: str, *, end_reason: str) -> None:
     """Emit *session_key*'s lifetime; never raises.
 
-    **Non-blocking, so it belongs in the same tick as the registry removal it
-    reports.** The start time is popped from the in-memory table, the histogram
-    is recorded in memory, and the only disk work is a single ``unlink``. That
-    is what lets every teardown path call this immediately after its
-    ``_sessions.pop`` and BEFORE its first ``await``. The earlier version read
-    the crumb off disk here, which forced the call to the end of teardown -- and
-    a replacement session registering under the same key during those awaits then
-    had its crumb consumed by its predecessor's teardown.
+    **The pop and the sample stay in the same tick as the registry removal they
+    report; only the unlink leaves it.** The start time is popped from the
+    in-memory table and the histogram recorded in memory, both BEFORE this
+    function's single suspension point -- so a teardown path still accounts for
+    its session immediately after its ``_sessions.pop`` and before anything can
+    interleave. The earlier version read the crumb off disk here, which forced the
+    call to the end of teardown -- and a replacement session registering under the
+    same key during those awaits then had its crumb consumed by its predecessor's
+    teardown.
 
     Popping the table entry is also the double-count defence: the teardown paths
     are not mutually exclusive (the idle sweep calls ``reset``), so whichever
     reaches the session first is the one that records it, and a second call finds
     nothing.
-    **The crumb unlink runs INLINE, and outside every lock.** It is one ``unlink``
-    syscall, so it costs this tick almost nothing, and handing it to the
-    maintenance pool instead was wrong twice over. A queued unlink can land AFTER a
-    successor registered under the same key and wrote its own crumb, deleting a
-    live session's crumb and losing its later crash. And
-    ``shutdown_maintenance_executor`` drains with ``cancel_futures=True``, so at
-    ``close_all`` -- exactly when that pool is flooded with teardown work -- the
-    unlink is cancelled outright, leaving behind the crumb of a session that ended
-    cleanly for the next boot to back-fill as ``crashed``: orderly shutdown would
-    inflate the very population this instrument exists to measure.
 
-    It holds no lock while doing it, and must not. This runs on the event loop, so
-    waiting on ``_crumb_io_lock`` -- which worker threads hold across filesystem
-    latency -- would park the gateway behind a crumb read. No lock is needed
-    either: the backfill skips every crumb whose owner is live, so it never looks
+    **Why the unlink is awaited off the loop rather than run inline.** Inline, it
+    is one syscall against the data home on the event loop, which is nothing until
+    that home is slow or network-backed and every gateway task parks behind one
+    closing session. Queued fire-and-forget, it is dropped exactly when it matters
+    -- see :func:`_unlink_generations`. Awaiting a worker hop is the only shape
+    that is both off the loop and never dropped, and it is the shape
+    :func:`record_session_started` already uses for the matching write. Callers
+    hold the session registry lock across the await, so no start, end or successor
+    can interleave with it either.
+
+    **The sample is emitted BEFORE the hop, the opposite of the start path's
+    counter, because the risks are opposite.** A cancelled start is rolled back
+    and never existed, so counting it before its cancellable point would report a
+    session that never was. An end cannot be rolled back -- the pop has already
+    consumed the only record of this generation -- so the session HAS ended
+    whatever happens next. Emitting first is therefore what keeps the sample when
+    the await is cancelled, and it measures the lifetime at the pop rather than a
+    worker round-trip later.
+
+    **A cancellation at the hop is ABSORBED, not propagated, and that is what
+    makes the new suspension point safe to give a teardown.** The registry pop is
+    the caller's point of no return: past it the session is gone from the registry
+    and only the caller's remaining cleanup can finish the job -- ``destroy``
+    deletes the session-map entry in a ``finally`` BELOW this call, and
+    ``discard_conversation`` and ``reset`` clear the resume SID on the line after
+    the lock. Raising here would exit those callers before that cleanup, leaving a
+    destroyed session's mapping behind for the next boot to resume: a cancellation
+    cannot undo a teardown, it can only leave it half done, so the correct answer
+    is to let the teardown finish. The cancellation is deferred rather than
+    discarded -- every caller's next ``await`` is inside the protective block, so a
+    still-cancelling task is cancelled there instead, where its ``finally`` runs.
+    The crumb is not at risk either way: :func:`_unlink_generations` consumes it
+    inline when its worker hop is cancelled.
+
+    Takes no lock across the hop, and must not take ``_crumb_io_lock`` at all:
+    worker threads hold that across filesystem latency, so waiting on it here
+    would park the loop on the very syscall this moved off it. No lock is needed
+    either -- the backfill skips every crumb whose owner is live, so it never looks
     at one this process wrote, and an in-flight writer for this key self-corrects
     by re-checking the generation this function has just popped.
     """
@@ -560,16 +616,75 @@ def record_session_ended(session_key: str, *, end_reason: str) -> None:
         # -- and the files sharing this digest belong to other processes or earlier
         # runs. Unlinking those unconditionally was the sibling-clobbering bug.
         return
-    # Unlinked OUTSIDE the lock: this runs on the event loop, and the table lock is
-    # never held across I/O. Removing the file even when the duration cannot be
-    # emitted is deliberate -- the session is over, so its crumb must not survive
-    # for the next boot to read as a crash. The path names this writer and this
-    # generation, so no concurrent session's record is reachable from here.
-    _unlink(_crumb_path(session_key, started_at))
     try:
         _emit_duration(session_key, time.time() - started_at, end_reason)
     except Exception:
         logger.debug("session end emit failed", exc_info=True)
+    # Consumed OUTSIDE the table lock and OFF the loop. Removing the file even when
+    # the duration could not be emitted is deliberate -- the session is over, so its
+    # crumb must not survive for the next boot to read as a crash. The path names
+    # this writer and this generation, so no concurrent session's record is
+    # reachable from here.
+    try:
+        await _unlink_generations(((session_key, started_at),))
+    except BaseException:
+        # Absorbed so the caller's post-pop cleanup still runs; see the docstring.
+        logger.debug("session end crumb handoff interrupted", exc_info=True)
+
+
+async def record_sessions_ended(session_keys: Iterable[str], *, end_reason: str) -> None:
+    """Record the end of a whole drained set in ONE hop; never raises.
+
+    The bulk counterpart of :func:`record_session_ended`, for the four paths that
+    pop many keys at once: ``close_all``, ``drain_all_providers``,
+    ``retire_kiro_identity_sessions`` and the provider-factory reload.
+
+    **Why those paths need this rather than a loop of awaits.** Awaiting once per
+    key would put a cancellation point BETWEEN two keys, and every key after it
+    would be popped but unrecorded -- so its crumb survives and the next boot
+    reports it as ``crashed``. On ``close_all``, a path cancellation reaches by
+    design, that turns one orderly shutdown into a burst of fabricated failures in
+    the exact population this instrument exists to measure: strictly worse than the
+    on-loop unlink the await replaced. Popping the whole set under one lock hold and
+    unlinking it in one hop keeps the property the inline version had -- either
+    every key in the set is accounted for, or none of them is -- and costs one
+    worker round-trip instead of one per session on the path that drains the entire
+    registry.
+
+    A cancellation at the hop is ABSORBED for the reason
+    :func:`record_session_ended` gives: every caller here has already popped, and
+    ``close_all``'s own remaining shutdown work must still run.
+
+    *session_keys* is materialised before the lock is taken, so a caller may pass a
+    view over the registry it is draining without this iterating it under the lock.
+    """
+    if end_reason not in END_REASONS:
+        return
+    keys = [key for key in session_keys if key]
+    if not keys:
+        return
+    consumed: list[tuple[str, float]] = []
+    with _live_lock:
+        for key in keys:
+            started_at = _live_starts.pop(key, None)
+            if started_at is not None:
+                consumed.append((key, started_at))
+    if not consumed:
+        return
+    # One clock reading for the whole set: these sessions ended together, and
+    # letting each sample drift by its position in the loop would report the
+    # ordering of a teardown as a difference in lifetime.
+    ended_at = time.time()
+    for key, started_at in consumed:
+        try:
+            _emit_duration(key, ended_at - started_at, end_reason)
+        except Exception:
+            logger.debug("session end emit failed", exc_info=True)
+    try:
+        await _unlink_generations(consumed)
+    except BaseException:
+        # Absorbed so the caller's post-pop cleanup still runs; see the docstring.
+        logger.debug("session end crumb handoff interrupted", exc_info=True)
 
 
 def backfill_crashed_sessions(started_before: float | None = None) -> int:
@@ -683,6 +798,99 @@ def _last_activity(session_key: str) -> float | None:
         return path.stat().st_mtime
     except Exception:
         return None
+
+
+async def _unlink_generations(generations: Sequence[tuple[str, float]]) -> None:
+    """Consume the crumbs of *generations* on a worker thread; never raises.
+
+    **The hop is AWAITED, not queued, and that distinction is the whole reason the
+    unlink stayed on the loop for as long as it did.**
+    ``shutdown_maintenance_executor`` drains with ``cancel_futures=True``, so a
+    fire-and-forget unlink is dropped at ``close_all`` -- exactly when teardown is
+    heaviest -- and the crumb of a cleanly ended session then survives to the next
+    boot to be back-filled as ``crashed``. A dropped unlink is worse than a slow
+    one, because it manufactures a failure in the one population this instrument
+    exists to measure. Awaiting keeps the syscall off the loop without ever
+    dropping it, and the caller holds the session registry lock across it, so
+    nothing can interleave either.
+
+    **Cancelling the await must neither drop the unlink nor put it back on the
+    loop, and a shielded bare executor future is the only shape that does both.**
+    Three rounds of review narrowed this to one line, so the reasoning is recorded
+    in full.
+
+    ``asyncio.to_thread`` submits before it suspends, but submitted is not started:
+    on a saturated executor the work item is still queued, and cancelling the await
+    reaches the underlying ``concurrent.futures.Future`` through
+    ``futures._chain_future``'s ``_call_check_cancel``, which cancels a work item
+    that has not begun. That is the dropped unlink this whole design exists to
+    prevent -- the crumb survives to the next boot and a cleanly ended session is
+    reported as ``crashed``. Unlinking inline in the cancellation handler fixed the
+    drop but put a filesystem syscall back on the event loop, which is the thing
+    #7537 is about.
+
+    So the hop is a BARE ``run_in_executor`` future, awaited through
+    :func:`asyncio.shield`. Cancelling the shield leaves the inner future alone, so
+    nothing cancels the queued work and it runs when a thread frees up. Two details
+    make abandoning it safe, and both are why this is not the fire-and-forget shape
+    the start path forbids:
+
+    * It is a Future, NOT a Task. ``asyncio.runners._cancel_all_tasks`` at loop
+      teardown iterates ``all_tasks()``, which holds Tasks only -- so shielding a
+      ``to_thread`` COROUTINE would be wrong, because ``shield`` would wrap it in a
+      Task that loop teardown cancels, dropping a still-queued item all over again.
+      A bare future survives that sweep, and ``shutdown_default_executor(wait=True)``
+      then drains the queue; even without it, ``ThreadPoolExecutor``'s ``atexit``
+      hook runs queued items before its sentinel.
+    * A worker finishing after the loop closed cannot raise "Event loop is closed"
+      -- ``_chain_future._call_set_state`` returns early when ``dest_loop.is_closed()``
+      rather than calling ``call_soon_threadsafe``. That failure (see
+      ``test_the_crumb_write_is_never_a_loop_bound_future``) was a start-path write
+      that was never awaited at all; here the normal path awaits to completion and
+      only a cancellation abandons the future.
+
+    The start path still must not do this: its write has to be ORDERED under the
+    caller's registry lock, so it cannot be allowed to land late. An end's unlink
+    can, because the crumb name encodes the writer and the generation -- a late
+    unlink can only ever reach the file its own session wrote.
+
+    This helper therefore never raises, so it cannot abort a caller mid-teardown
+    either; each end path keeps its own guard for the reason
+    :func:`record_session_ended` documents.
+
+    Takes no lock. Each path names this process and one generation, and the
+    backfill skips every crumb whose owner is live, so the files this removes and
+    the files that scan reads are disjoint sets.
+    """
+    if not generations:
+        return
+    paths = [_crumb_path(session_key, started_at) for session_key, started_at in generations]
+    try:
+        hop = asyncio.get_running_loop().run_in_executor(None, _unlink_all, paths)
+    except Exception:
+        # No worker to hop onto -- the default executor is already shut down, which
+        # only happens once the loop itself is being torn down. Left for the boot
+        # backfill rather than unlinking on the loop; its ownership check means the
+        # crumb is only ever claimed once this process is gone.
+        logger.debug("session crumb unlink could not be scheduled", exc_info=True)
+        return
+    try:
+        await asyncio.shield(hop)
+    except BaseException:
+        # The shield was cancelled, not the hop: the executor still owns the work
+        # and runs it. Nothing is retried here, and nothing runs on the loop.
+        logger.debug("session crumb unlink hop abandoned to its worker", exc_info=True)
+
+
+def _unlink_all(paths: Sequence[Path]) -> None:
+    """Unlink every path in one worker hop; never raises.
+
+    One hop for the whole set rather than one per crumb: a mass teardown must not
+    pay a worker round-trip per session, and the set is already indivisible for the
+    caller (see :func:`record_sessions_ended`).
+    """
+    for path in paths:
+        _unlink(path)
 
 
 def _unlink(path: Path) -> None:

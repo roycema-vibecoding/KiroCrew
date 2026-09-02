@@ -858,12 +858,15 @@ start_pool()
 ## Removing a session from the registry: record the end
 
 **Every path that removes an entry from `_sessions` must report that removal to
-`metrics/sessions.py`** — with `record_session_ended(key, end_reason=...)` for a
-session that lived, or `discard_session_start(key)` for a registration being
-rolled back before it ever became one. This is a correctness requirement on
-lifecycle code, not a telemetry nicety, and it is documented here rather than only
-in the metrics module because the people who can break it are editing this
-subsystem.
+`metrics/sessions.py`** — with `await record_session_ended(key, end_reason=...)` for
+a session that lived, `await record_sessions_ended(keys, end_reason=...)` for a path
+that drains many at once, or `await discard_session_start(key)` for a registration
+being rolled back before it ever became one. All three are coroutines: the
+breadcrumb unlink is a filesystem syscall and must not run on the event loop, where
+a slow or network-backed data home would park every gateway task behind one closing
+session. This is a correctness requirement on lifecycle code, not a telemetry
+nicety, and it is documented here rather than only in the metrics module because the
+people who can break it are editing this subsystem.
 
 The reason it matters more than a missing sample: a session start writes a
 breadcrumb file that survives process death, which is what lets a session killed
@@ -874,10 +877,25 @@ never happened**, inside the one population the instrument exists to expose.
 
 Practical rules when you add or change a removal path:
 
-- Report it in the SAME event-loop tick as the `pop` / `del` / `clear`, before the
-  path's first `await`. Later than that, a racing cold start can register a
-  successor under the same key and have its record consumed by the predecessor's
-  teardown.
+- Report it while you still hold the session registry lock, in the same tick as the
+  `pop` / `del` / `clear`. The call's own pop and histogram record happen before its
+  single suspension point, and holding the lock across that point is what keeps a
+  racing cold start from registering a successor under the same key and having its
+  record consumed by the predecessor's teardown. Reporting AFTER the path's other
+  awaits is the bug this rule exists to prevent.
+- Drain many keys with ONE `record_sessions_ended` call, never a loop of
+  `record_session_ended` awaits. A per-key await puts a cancellation point between
+  two keys, so every key after it is popped but unrecorded — and on `close_all`,
+  which a cancellation reaches by design, that fabricates a crash per remaining
+  session.
+- Keep your MANDATORY post-pop cleanup reachable. All three recording coroutines
+  absorb a cancellation at their crumb hop for exactly this reason, so the call
+  itself will not abort you — but the rule that makes that safe is yours to hold:
+  once you have popped the registry you are past the point of no return, so the
+  session-map mutation that finishes the teardown (`destroy`'s `delete`,
+  `discard_conversation`'s and `reset`'s `clear_sid`) must not sit behind a
+  suspension point that can be skipped. Put it in a `finally` that covers every
+  await after the pop, and never add a bare `await` between the pop and it.
 - Give it its own `end_reason` if it is genuinely a different event. The enum is
   closed and lives in `metrics/sessions.py`; reusing a label merges two
   populations, and a metric is not a good reason to grow a lifecycle signature.
