@@ -23,6 +23,7 @@ See ``docs/system-specs/modules/ops-mission-control.md`` (data model).
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -64,6 +65,30 @@ STATE_UNKNOWN = "unknown"
 #: ``suppressed`` means "we read it and a human parked it".
 STATE_SUPPRESSED = "suppressed"
 VALID_STATES: frozenset[str] = frozenset({STATE_FIRING, STATE_OK, STATE_UNKNOWN, STATE_SUPPRESSED})
+
+
+class CorruptDocumentError(json.JSONDecodeError):
+    """A stored document that PARSED but is not usable as a mutation base.
+
+    Raised by the ``*_for_update`` readers when a document is valid JSON yet structurally
+    wrong -- a root that is not an object, or a row that is not one. Those cases destroy
+    data exactly like a parse failure does if the reader normalizes them away, because the
+    mutation rewrites the whole file from whatever the reader returned.
+
+    Subclasses :class:`json.JSONDecodeError` DELIBERATELY, and that is load-bearing rather
+    than convenient: every caller's corruption clause is written against
+    ``json.JSONDecodeError``, so this routes correctly through all of them with no change,
+    while a fresh exception type would be caught by none and would silently reopen the very
+    data loss those clauses exist to stop. Note that both are ``ValueError`` subclasses, so
+    a caller with an unrelated ``except ValueError`` will still claim this unless its
+    corruption arm comes first.
+
+    The subclass exists so the raises are greppable and their intent explicit instead of a
+    parser exception carrying a meaning the parser never assigned it. Suggested in review
+    (Design Review) and worth having before #7805 replicates this idiom across the four
+    merged siblings.
+    """
+
 
 STATUS_UNCLAIMED = "unclaimed"
 STATUS_DISPATCHED = "dispatched"

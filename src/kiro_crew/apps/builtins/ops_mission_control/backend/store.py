@@ -51,6 +51,7 @@ from kiro_crew.apps.builtins.ops_mission_control.backend.models import (
     VALID_CLAIMANTS,
     VERIFY_NOT_CHECKABLE,
     VERIFY_STILL_FIRING,
+    CorruptDocumentError,
     Incident,
     Signal,
     proposal_digest,
@@ -158,21 +159,120 @@ def incident_log_path(incident_id: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _read_index_unlocked() -> dict[str, Incident]:
-    try:
-        raw = json.loads(index_path().read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return {}
+def _coerce_index(raw: Any, *, strict: bool = False) -> dict[str, Incident]:
+    """Normalize a parsed index document, skipping entries that will not load.
+
+    Shared by both readers below so the only thing that can differ between them
+    is which read FAILURES are allowed to answer "empty".
+
+    ``strict`` is the update path, and it exists because SKIPPING is not free there.
+    The display read may drop an entry it cannot load and still render a useful board;
+    a mutation rewrites the WHOLE file from what this returns, so every skipped entry
+    is deleted from disk permanently. One hand-broken row in a fifty-incident index
+    would be silently dropped by the next `claim` -- the same "recoverable bytes
+    destroyed with no error" this module's strict readers exist to prevent, reached
+    through normalization rather than through a failed parse. Found in review (GPT 5.6).
+
+    Raised as ``json.JSONDecodeError`` deliberately rather than a new exception type:
+    a document that is not an object, or that holds a row which will not load, is
+    malformed in exactly the sense a parse failure is, so every caller's existing
+    corruption clause already routes it correctly. A fresh type would be caught by
+    none of them, which is how this class of bug gets reintroduced.
+    """
     if not isinstance(raw, dict):
+        if strict:
+            raise CorruptDocumentError("index root is not a JSON object", str(raw)[:120], 0)
         return {}
     out: dict[str, Incident] = {}
     for key, value in raw.items():
-        if isinstance(value, dict):
-            try:
-                out[str(key)] = Incident.from_dict(value)
-            except (TypeError, ValueError):
-                logger.warning("ops-mission-control: skipping malformed index entry %r", key)
+        if not isinstance(value, dict):
+            if strict:
+                raise CorruptDocumentError(
+                    f"index entry {key!r} is not an object", str(value)[:120], 0
+                )
+            continue
+        try:
+            out[str(key)] = Incident.from_dict(value)
+        except (TypeError, ValueError) as exc:
+            if strict:
+                raise CorruptDocumentError(
+                    f"index entry {key!r} will not load", str(value)[:120], 0
+                ) from exc
+            logger.warning("ops-mission-control: skipping malformed index entry %r", key)
     return out
+
+
+def _read_index_unlocked() -> dict[str, Incident]:
+    """The dispatch index, or ``{}`` when there is nothing readable.
+
+    A DISPLAY read: the board, the counts and ``find_by_signal`` must answer on an
+    index they could not load rather than failing the route. See
+    :func:`_read_index_for_update` for why a mutation may not stand on the same
+    answer.
+
+    An absent file is silent -- that is a fresh install, not a fault. Anything else
+    is logged, because the failure this degrades into looks exactly like health: an
+    empty board renders as "nothing is wrong". Nothing else would prompt an
+    operator to look.
+    """
+    try:
+        raw = json.loads(index_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError):
+        logger.warning(
+            "ops-mission-control: dispatch index unreadable; the board will render empty",
+            exc_info=True,
+        )
+        return {}
+    return _coerce_index(raw)
+
+
+def _read_index_for_update() -> dict[str, Incident]:
+    """The index a read-modify-write is allowed to publish over.
+
+    Callers hold ``_IndexLock``; this only decides what an unreadable file means.
+
+    Every mutation below rewrites the WHOLE document from what it read, so an
+    empty base is not "no incidents to carry forward" -- it is "delete every
+    incident on the board". Only a MISSING file makes that true. An unreadable
+    one (a transient EACCES/EIO, a scanner holding the handle on Windows) is an
+    index we still have.
+
+    Truncating it is worse than losing a view, because the index IS the claim
+    ledger. ``claim`` is a compare-and-set against these rows: with the board
+    emptied, every signal reads as unowned, so the next heartbeat re-claims
+    alarms that are already being worked and opens duplicate investigations of
+    each one -- and in ``act`` mode a duplicate investigation is a second real
+    write against the operator's production paging. The per-incident markdown
+    logs survive on disk but nothing indexes them any more, and an open incident
+    that is no longer listed is never swept, resolved, or answered.
+
+    Corruption propagates too, and that is a DELIBERATE divergence from the four
+    merged siblings of this idiom (``library.py``, ``shares.py``, ``secrets.py``,
+    ``policy_store.py``), which all still read an unparseable document as empty.
+    Their justification is real -- a document that failed to parse carries nothing
+    to merge into -- but "cannot merge into" is not "safe to destroy". A truncated
+    index still holds most of its records verbatim, and replacing it discards the
+    operator's only chance to recover them by hand. Refusing costs one skipped
+    mutation and a visible error; overwriting costs the records, silently. Found in
+    review (GPT 5.6). The siblings need the same treatment in a follow-up --
+    ``secrets.py`` most of all, since there the discarded bytes are credentials.
+    """
+    try:
+        raw = json.loads(index_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        # Re-raised as the named type so that EVERY refusal from this reader is one
+        # `CorruptDocumentError`, whatever door it came through -- a bad byte stream here, a
+        # bad shape in `_coerce_index` below. Review noted the subclass was one no catcher
+        # distinguished (First Principles), which was fair while a parse failure still
+        # arrived as the bare base class: the type described the raise site instead of being
+        # the reader's contract. Catchers written against `json.JSONDecodeError` keep working
+        # unchanged, because it still IS one.
+        raise CorruptDocumentError(exc.msg, exc.doc, exc.pos) from exc
+    return _coerce_index(raw, strict=True)
 
 
 def _write_index_unlocked(index: dict[str, Incident]) -> None:
@@ -271,7 +371,7 @@ def claim(
     the signal a responder most needs to see ("we fixed this and it came back").
     """
     with _IndexLock():
-        index = _read_index_unlocked()
+        index = _read_index_for_update()
 
         for inc in index.values():
             if inc.signal.id != signal.id:
@@ -334,7 +434,7 @@ def transition(incident_id: str, new_status: Any, **updates: Any) -> Incident:
     must not assert any status, so it cannot revert a concurrent transition.
     """
     with _IndexLock():
-        index = _read_index_unlocked()
+        index = _read_index_for_update()
         incident = index.get(incident_id)
         if incident is None:
             raise KeyError(incident_id)
@@ -443,7 +543,7 @@ def sweep_stale(stale_after_secs: int, needs_human_after_secs: int | None = None
     released: list[str] = []
     now = datetime.now(timezone.utc)
     with _IndexLock():
-        index = _read_index_unlocked()
+        index = _read_index_for_update()
         changed = False
         for incident_id, inc in index.items():
             if inc.status not in _SWEEPABLE_STATUSES:
@@ -520,7 +620,7 @@ def prune_closed(*, keep: int = MAX_CLOSED_INCIDENTS) -> int:
     long-running incident that just finished is treated as recent.
     """
     with _IndexLock():
-        index = _read_index_unlocked()
+        index = _read_index_for_update()
         closed = [inc for inc in index.values() if inc.status in TERMINAL_STATUSES]
         if len(closed) <= keep:
             return 0
@@ -738,7 +838,7 @@ def decide_proposal(incident_id: str, *, approve: bool, digest: str = "") -> dic
     and an approval are both "exactly one winner" decisions on shared JSON.
     """
     with _IndexLock():
-        index = _read_index_unlocked()
+        index = _read_index_for_update()
         incident = index.get(incident_id)
         if incident is None:
             raise KeyError(incident_id)
@@ -842,7 +942,7 @@ def expire_stale_proposals(*, now: str = "") -> list[str]:
     cutoff = now or utc_now_iso()
     touched: list[str] = []
     with _IndexLock():
-        index = _read_index_unlocked()
+        index = _read_index_for_update()
         for inc in index.values():
             proposal = dict(inc.proposed_action or {})
             if str(proposal.get("state", "")) != PROPOSAL_PENDING:

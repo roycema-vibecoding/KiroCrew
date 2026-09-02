@@ -641,6 +641,40 @@ class TestLedgerHygieneWiring(unittest.IsolatedAsyncioTestCase):
             result = routes._index_ledger_safely()
         self.assertEqual(result, {"scanned": 0, "written": 0, "skipped": 0, "embedded": 0})
 
+    async def test_a_prune_fault_cannot_cost_the_ledger_push(self):
+        """`prune_closed` sits before the push, and making the index read strict gave it a
+        new way to raise.
+
+        Letting it escape would mean one EACCES skips pushing the ledger `hygiene` just
+        deduped -- a later fault costing an earlier step's work, which is the rule
+        `dispatch.run_cycle`'s maintenance guards exist to keep. Pruning is the most
+        deferrable step here (the next run retires the same incidents); the push is what
+        other instances are waiting on. Found in review (Opus 4.8), which named the ordering
+        consequence rather than the status code.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import store
+
+        def _refuse():
+            raise PermissionError(13, "Permission denied")
+
+        with mock.patch.object(store, "prune_closed", _refuse):
+            response, order = await self._run()
+
+        self.assertEqual(response.status, 200)
+        self.assertIn("sync:push", order, "the push must still run after a failed prune")
+        self.assertLess(order.index("hygiene"), order.index("sync:push"))
+
+    async def test_a_corrupt_index_still_stops_the_hygiene_pass(self):
+        """Corruption never self-heals, so it must not be skipped quietly on every run."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import store
+
+        def _corrupt():
+            raise json.JSONDecodeError("Expecting value", "{ not json", 2)
+
+        with mock.patch.object(store, "prune_closed", _corrupt):
+            with self.assertRaises(json.JSONDecodeError):
+                await self._run()
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -3366,6 +3400,215 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         self.assertEqual(body["code"], "policy_store_unwritable")
         self.assertIs(body["ok"], False)
 
+    async def test_a_refused_provider_config_write_is_a_coded_503(self):
+        """The companion strict read landed, so this write can now refuse too.
+
+        This helper's docstring said `set_top_level` had no such guarantee "yet" and
+        pointed at the companion PR for `providers/__init__.py`. That PR is this change,
+        so `merge_provider_config` now propagates a failed read and this route needed the
+        same coded refusal. Found in review (Opus 4.8, Design Review).
+        """
+        app = web.Application()
+        routes.register_routes(app)
+        with mock.patch.object(routes, "is_app_enabled", return_value=True):
+            with mock.patch.object(routes, "merge_provider_config", self._refuse):
+                client = await self._client(app)
+                resp = await client.put(
+                    "/api/apps/ops-mission-control/providers/datadog/config",
+                    json={"site": "datadoghq.eu"},
+                )
+                self.assertEqual(resp.status, 503)
+                body = await resp.json()
+
+        self.assertEqual(body["code"], "app_config_unreadable")
+
+    async def test_a_corrupt_provider_config_is_a_coded_500_not_a_bare_one(self):
+        """Corruption is not retryable, so it must not be advertised as a 503.
+
+        Found in review (GPT 5.6): the coded refusal covered only `OSError`, so a malformed
+        `config.json` still answered the bare uncoded 500 this PR set out to remove.
+        """
+        corrupt = json.JSONDecodeError("Expecting value", "{ not json", 2)
+
+        def _corrupt(*_a, **_kw):
+            raise corrupt
+
+        app = web.Application()
+        routes.register_routes(app)
+        with mock.patch.object(routes, "is_app_enabled", return_value=True):
+            with mock.patch.object(routes, "merge_provider_config", _corrupt):
+                client = await self._client(app)
+                resp = await client.put(
+                    "/api/apps/ops-mission-control/providers/datadog/config",
+                    json={"site": "datadoghq.eu"},
+                )
+                self.assertEqual(resp.status, 500)
+                body = await resp.json()
+
+        self.assertEqual(body["code"], "app_config_corrupt")
+
+    async def test_a_corrupt_index_is_not_reported_as_an_illegal_transition(self):
+        """The misclassification, pinned. This is the worst of the uncoded cases.
+
+        `_handle_transition` caught `except ValueError`, and `JSONDecodeError` subclasses
+        `ValueError`, so a corrupt index answered `409 illegal_transition` carrying the JSON
+        parser's message -- telling the operator their own state change was invalid when the
+        real fault was a broken file. A 409 sends them to fix their request; nothing sends
+        them to the file. Found in review (Opus 4.8); it is the same accident this change
+        closed at three non-route callers.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import store
+
+        corrupt = json.JSONDecodeError("Expecting value", "{ not json", 2)
+
+        def _corrupt(*_a, **_kw):
+            raise corrupt
+
+        app = web.Application()
+        routes.register_routes(app)
+        with mock.patch.object(routes, "is_app_enabled", return_value=True):
+            with mock.patch.object(store, "get_incident", lambda *_a, **_kw: None):
+                with mock.patch.object(store, "transition", _corrupt):
+                    client = await self._client(app)
+                    resp = await client.post(
+                        "/api/apps/ops-mission-control/incident/transition",
+                        json={"id": "INV-1", "status": "resolved"},
+                    )
+                    body = await resp.json()
+
+        self.assertNotEqual(resp.status, 409, "corruption was blamed on the operator's request")
+        self.assertNotEqual(body.get("code"), "illegal_transition")
+        self.assertEqual(resp.status, 500)
+        self.assertEqual(body["code"], "dispatch_index_corrupt")
+
+    async def test_an_unreadable_index_on_transition_is_a_retryable_coded_503(self):
+        """The other half: transient gets 503, so "retry" is only said when it can work."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import store
+
+        app = web.Application()
+        routes.register_routes(app)
+        with mock.patch.object(routes, "is_app_enabled", return_value=True):
+            with mock.patch.object(store, "get_incident", lambda *_a, **_kw: None):
+                with mock.patch.object(store, "transition", self._refuse):
+                    client = await self._client(app)
+                    resp = await client.post(
+                        "/api/apps/ops-mission-control/incident/transition",
+                        json={"id": "INV-1", "status": "resolved"},
+                    )
+                    body = await resp.json()
+
+        self.assertEqual(resp.status, 503)
+        self.assertEqual(body["code"], "dispatch_index_unreadable")
+
+    async def test_a_refused_manual_claim_is_coded_rather_than_a_bare_500(self):
+        """`claim` raises on both failures by design, so the board's own route must translate."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import models, store
+
+        firing = models.Signal.create(
+            source="cloudwatch", native_id="alarm/x", title="broke", labels={"alarm_name": "x"}
+        )
+
+        app = web.Application()
+        routes.register_routes(app)
+        with mock.patch.object(routes, "is_app_enabled", return_value=True):
+            with mock.patch.object(
+                routes.get_registry(), "poll_all", mock.AsyncMock(return_value=([firing], {}))
+            ):
+                with mock.patch.object(store, "claim", self._refuse):
+                    client = await self._client(app)
+                    resp = await client.post(
+                        "/api/apps/ops-mission-control/incident/claim",
+                        json={"signal": {"id": firing.id, "source": "cloudwatch"}},
+                    )
+
+        self.assertEqual(resp.status, 503)
+        self.assertEqual((await resp.json())["code"], "dispatch_index_unreadable")
+
+    async def test_a_corrupt_policy_store_on_settings_is_a_coded_500(self):
+        """The regression this change introduced into a MERGED helper.
+
+        `_settings_write_or_refuse` caught only `OSError`. Making the config reader refuse on
+        a malformed document gave `set_top_level` a second way to raise, and the bare 500 came
+        back for it -- in the one helper whose docstring had promised this PR would close that
+        gap. Found in review (First Principles).
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store
+
+        corrupt = json.JSONDecodeError("Expecting value", "{ not json", 2)
+
+        def _corrupt(*_a, **_kw):
+            raise corrupt
+
+        app = web.Application()
+        routes.register_routes(app)
+        with mock.patch.object(routes, "is_app_enabled", return_value=True):
+            with mock.patch.object(policy_store, "set_ceiling", _corrupt):
+                client = await self._client(app)
+                resp = await client.put(
+                    "/api/apps/ops-mission-control/settings", json={"mode": "observe"}
+                )
+                body = await resp.json()
+
+        self.assertEqual(resp.status, 500)
+        self.assertEqual(body["code"], "policy_store_corrupt")
+        self.assertIs(body["ok"], False)
+
+    async def test_a_corrupt_index_is_not_reported_as_an_invalid_proposal(self):
+        """The last reachable `ValueError` arm, found by auditing all ten in this file.
+
+        `propose_action` reaches the strict reader through `update_fields` -> `transition`,
+        so a corrupt index raises `CorruptDocumentError` -- a `ValueError` -- and the
+        `except ValueError` arm reported it as `400 invalid_proposal`. That is worse than the
+        bare 500 it replaces: a 400 blames the operator's proposal, so they re-type the form
+        while the real fault sits on disk. Nine of the ten arms needed nothing -- three
+        already carried this clause and six cannot reach a strict reader at all.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import store
+
+        corrupt = json.JSONDecodeError("Expecting value", "{ not json", 2)
+
+        def _corrupt(*_a, **_kw):
+            raise corrupt
+
+        app = web.Application()
+        routes.register_routes(app)
+        with mock.patch.object(routes, "is_app_enabled", return_value=True):
+            with mock.patch.object(store, "propose_action", _corrupt):
+                client = await self._client(app)
+                resp = await client.post(
+                    "/api/apps/ops-mission-control/incident/propose",
+                    json={"id": "INV-1", "action": "silence", "sink": "pagerduty"},
+                )
+                body = await resp.json()
+
+        self.assertNotEqual(resp.status, 400, "corruption was blamed on the operator's proposal")
+        self.assertNotEqual(body.get("code"), "invalid_proposal")
+        self.assertEqual(resp.status, 500)
+        self.assertEqual(body["code"], "dispatch_index_corrupt")
+
+    async def test_a_refused_proposal_decision_is_a_coded_503(self):
+        """A human's approval of a production action must not fail ambiguously.
+
+        `decide_proposal` is a locked read-modify-write that now refuses rather than
+        publishing over a failed read. Before this arm the handler could only answer a
+        coded 404, so a transient read failure became a bare 500 with no `code`.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import store
+
+        app = web.Application()
+        routes.register_routes(app)
+        with mock.patch.object(routes, "is_app_enabled", return_value=True):
+            with mock.patch.object(store, "decide_proposal", self._refuse):
+                client = await self._client(app)
+                resp = await client.post(
+                    "/api/apps/ops-mission-control/incident/proposal/decide",
+                    json={"id": "INV-1", "approve": True},
+                )
+                self.assertEqual(resp.status, 503)
+                body = await resp.json()
+
+        self.assertEqual(body["code"], "dispatch_index_unreadable")
+
     async def test_a_refused_destination_write_is_a_coded_503_too(self):
         """The keys reached THROUGH an intermediary, which the first pass missed.
 
@@ -3428,3 +3671,58 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
 
         self.assertIs(body["ok"], True)
         self.assertEqual(body["applied"]["mode"], "observe")
+
+
+class TestCorruptionIsNotSwallowedWhenSchedulingVerification(unittest.TestCase):
+    """Corruption while scheduling a recheck must be REPORTED -- neither swallowed nor raised.
+
+    Two review lanes found opposite halves of this. Design Review caught that a corrupt index
+    was silently swallowed: `_schedule_verification` catches `(KeyError, ValueError, OSError)`
+    and `JSONDecodeError` subclasses `ValueError`, so corruption was filed under the
+    raced-away case at debug level and the action ran with no recheck, forever, invisibly.
+    GPT 5.6 then caught that simply re-raising is also wrong: both callers have ALREADY done
+    the real external write by the time this runs, so a raise turns a completed action into a
+    500 and invites a retry -- in `act` mode, a second real write against production.
+
+    So corruption gets its own clause that logs and writes a SEL audit entry, then returns
+    `("", "")` like the transient case. The action's true outcome still reaches the operator,
+    and the lost verification is durably recorded rather than dropped.
+    """
+
+    @staticmethod
+    def _raiser(exc):
+        def _fn(*_a, **_kw):
+            raise exc
+
+        return _fn
+
+    def test_a_corrupt_index_is_audited_rather_than_raising_after_the_action_ran(self):
+        from kiro_crew.apps.builtins.ops_mission_control.backend import store
+
+        corrupt = json.JSONDecodeError("Expecting value", "{ not json", 2)
+        with mock.patch.object(store, "update_fields", self._raiser(corrupt)):
+            with mock.patch.object(routes, "_audit") as audited:
+                result = routes._schedule_verification("INV-1", "silence", 60)
+
+        self.assertEqual(result, ("", ""), "a completed action must not be reported as failed")
+        ops = [c.args[0] for c in audited.call_args_list]
+        self.assertIn(
+            "action_verification_unscheduled",
+            ops,
+            "corruption was swallowed with no durable record",
+        )
+        outcome = next(c for c in audited.call_args_list if c.args[0] == "action_verification_unscheduled")
+        self.assertEqual(outcome.args[2], "failure")
+
+    def test_a_transient_failure_is_not_audited_as_an_unscheduled_verification(self):
+        """The asymmetry: a transient miss is retried by the next pass, so it stays quiet."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import store
+
+        denied = PermissionError(13, "Permission denied")
+        with mock.patch.object(store, "update_fields", self._raiser(denied)):
+            with mock.patch.object(routes, "_audit") as audited:
+                result = routes._schedule_verification("INV-1", "silence", 60)
+
+        self.assertEqual(result, ("", ""))
+        ops = [c.args[0] for c in audited.call_args_list]
+        self.assertNotIn("action_verification_unscheduled", ops)

@@ -10,6 +10,7 @@ directly rather than through the HTTP layer.
 data home.
 """
 
+import contextlib
 import json
 import shutil
 import tempfile
@@ -979,9 +980,7 @@ class TestTierArming(_HomeIsolated):
         manifest = json.loads(
             (Path(rotation.__file__).resolve().parents[1] / "app.json").read_text(encoding="utf-8")
         )
-        message = next(
-            c["message"] for c in manifest["crons"] if c["name"] == "rotation-check"
-        )
+        message = next(c["message"] for c in manifest["crons"] if c["name"] == "rotation-check")
         self.assertIn("/rotation/arm", message)
         self.assertNotIn("cron_pause", message)
         self.assertNotIn("cron_resume", message)
@@ -2398,9 +2397,7 @@ class TestArmingOnAnAlreadyUnreadableStore(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(body["ok"])
         self.assertEqual(body["code"], "cron_store_unreadable")
         self.assertEqual(body["changed"], [])
-        self.assertEqual(
-            svc.calls, [], "nothing may be written while the store cannot be read"
-        )
+        self.assertEqual(svc.calls, [], "nothing may be written while the store cannot be read")
 
     async def test_the_real_cron_service_reaches_the_state_the_fake_models(self):
         """The fake above is only worth anything if the real service gets here.
@@ -2785,9 +2782,7 @@ class TestTheWriteGateConsultsEveryRotation(_HomeIsolated):
         """Indeterminacy keeps permitting, whichever contract the source implements."""
         from kiro_crew.apps.builtins.ops_mission_control.backend import rotation
 
-        self._install(
-            self._async_only_source("companion-rota", on_shift=False, unknown=True)
-        )
+        self._install(self._async_only_source("companion-rota", on_shift=False, unknown=True))
         self.assertFalse(rotation._definitely_off_shift())
 
     def test_an_async_only_source_that_raises_is_a_fault_not_an_absence(self):
@@ -2981,11 +2976,18 @@ class TestProposalExpiryIsAtomic(_HomeIsolated):
         from kiro_crew.apps.builtins.ops_mission_control.backend import store
 
         source = inspect.getsource(store.expire_stale_proposals)
-        code = "\n".join(
-            line for line in source.splitlines() if not line.lstrip().startswith("#")
-        )
+        code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
         self.assertIn("_IndexLock()", code)
-        self.assertIn("_read_index_unlocked()", code)
+        # The STRICT reader specifically. `_read_index_unlocked` collapses a FAILED read to
+        # an empty index, which is right for the board and wrong as the base of this
+        # whole-document rewrite -- reading through it here would publish an empty index
+        # over every incident on one transient EACCES.
+        self.assertIn("_read_index_for_update()", code)
+        self.assertNotIn(
+            "_read_index_unlocked()",
+            code,
+            "the sweep rewrites the index from the lenient display read",
+        )
         self.assertNotIn(
             "update_fields(",
             code,
@@ -2993,7 +2995,7 @@ class TestProposalExpiryIsAtomic(_HomeIsolated):
         )
         self.assertNotIn(
             "read_index()",
-            code.replace("_read_index_unlocked()", ""),
+            code.replace("_read_index_for_update()", ""),
             "the sweep reads through the unlocked snapshot",
         )
 
@@ -3182,9 +3184,7 @@ class TestUpdateFieldsDoesNotCarryAStaleStatus(_HomeIsolated):
         from kiro_crew.apps.builtins.ops_mission_control.backend import store
 
         source = inspect.getsource(store.update_fields)
-        code = "\n".join(
-            line for line in source.splitlines() if not line.lstrip().startswith("#")
-        )
+        code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
         self.assertIn("_KEEP_STATUS", code)
         self.assertNotIn(
             ".status",
@@ -3192,3 +3192,275 @@ class TestUpdateFieldsDoesNotCarryAStaleStatus(_HomeIsolated):
             "update_fields reads a status outside the lock; it must pass _KEEP_STATUS",
         )
         self.assertNotIn("get_incident(", code)
+
+
+class TestTheIndexIsNeverPublishedOverAFailedRead(_HomeIsolated):
+    """The BASE read of a read-modify-write may not fail open.
+
+    ``_read_index_unlocked`` collapses every failure to ``{}``, which is right for
+    the board, the counts and ``find_by_signal`` — a render must not fail on an
+    index it could not load. It is wrong as the base of the six locked mutations,
+    which rewrite the WHOLE document: there ``{}`` means "delete every incident on
+    the board", and one transient EACCES/EIO published it.
+
+    The index is not a view, it is the CLAIM LEDGER: ``claim`` is a compare-and-set
+    against these rows. Emptied, every signal reads as unowned, so the next
+    heartbeat re-claims alarms already being worked and opens a duplicate
+    investigation of each — and in ``act`` mode a duplicate investigation is a
+    second real write against the operator's production paging. The per-incident
+    markdown logs survive on disk with nothing indexing them, and an open incident
+    that is no longer listed is never swept, resolved, or answered.
+    """
+
+    def _unreadable_index(self):
+        """Fail ONLY the index file's read, as a transient EACCES would.
+
+        Scoped by path: a blanket ``read_text`` failure would also break home
+        resolution and the per-incident logs, and the test would pass for the
+        wrong reason.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import store
+
+        target = store.index_path()
+        real_read_text = Path.read_text
+
+        def _guarded(path_self, *args, **kwargs):
+            if Path(path_self) == target:
+                raise PermissionError(13, "Permission denied")
+            return real_read_text(path_self, *args, **kwargs)
+
+        return mock.patch.object(Path, "read_text", _guarded)
+
+    def test_a_read_that_failed_never_truncates_the_index(self):
+        """The durable harm, asserted directly: the incidents already claimed
+        must still be on the board afterwards."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import models, store
+
+        first = store.claim(self._signal(native_id="alarm/one"), operating_mode=models.MODE_OBSERVE)
+        second = store.claim(
+            self._signal(native_id="alarm/two"), operating_mode=models.MODE_OBSERVE
+        )
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert first is not None and second is not None
+        before = store.index_path().read_bytes()
+
+        with self._unreadable_index():
+            with contextlib.suppress(OSError):
+                store.claim(
+                    self._signal(native_id="alarm/three"), operating_mode=models.MODE_OBSERVE
+                )
+            with contextlib.suppress(OSError):
+                store.prune_closed(keep=0)
+
+        self.assertEqual(
+            store.index_path().read_bytes(),
+            before,
+            "a failed read was published back over the index",
+        )
+        self.assertEqual(
+            sorted(store.read_index()),
+            sorted([first.incident_id, second.incident_id]),
+            "a failed read dropped incidents that were still claimed",
+        )
+
+    def test_an_unreadable_index_refuses_a_claim(self):
+        """A claim is a compare-and-set. It cannot be decided against an index
+        nobody read, and ``None`` here would read as "someone else owns it"."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import models, store
+
+        store.claim(self._signal(native_id="alarm/one"), operating_mode=models.MODE_OBSERVE)
+        with self._unreadable_index():
+            with self.assertRaises(OSError):
+                store.claim(self._signal(native_id="alarm/two"), operating_mode=models.MODE_OBSERVE)
+
+    def test_an_unreadable_index_refuses_a_transition(self):
+        """``transition`` raises ``KeyError`` for an unknown incident, so on the
+        lenient read a real incident became "unknown" — a 404 for a row that is
+        on disk. The read failure must surface as itself."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import models, store
+
+        inc = store.claim(self._signal(), operating_mode=models.MODE_OBSERVE)
+        assert inc is not None
+        with self._unreadable_index():
+            with self.assertRaises(OSError):
+                store.transition(inc.incident_id, models.STATUS_INVESTIGATING)
+
+    def test_a_missing_index_is_still_a_first_claim(self):
+        """Absent is the one failure where ``{}`` is the truth. The guard must
+        not turn the app's very first claim into an error."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import models, store
+
+        self.assertFalse(store.index_path().exists())
+        inc = store.claim(self._signal(), operating_mode=models.MODE_OBSERVE)
+        self.assertIsNotNone(inc)
+        assert inc is not None
+        self.assertIn(inc.incident_id, store.read_index())
+
+    def test_a_corrupt_index_refuses_the_mutation_instead_of_replacing_it(self):
+        """Inverted deliberately: this used to assert repair-on-write.
+
+        The four merged siblings of this idiom (`library.py`, `shares.py`,
+        `secrets.py`, `policy_store.py`) still read an unparseable document as empty,
+        and their reasoning is real -- nothing parsed, so there is nothing to merge
+        into. But "cannot merge into" is not "safe to destroy": a truncated index
+        still holds most of its records verbatim, and the mutation would replace the
+        file and take them with it. Refusing costs one skipped mutation and a visible
+        error; the old behaviour cost the records, silently. Found in review (GPT 5.6).
+
+        The fixture writes malformed JSON to the real index path, so the corruption
+        is reached by the update reader itself rather than simulated -- and `claim`
+        is used because it is the mutation with no prior lookup to short-circuit on.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import models, store
+
+        store.index_path().write_text('{"INV-1": {"incident_id": "INV-1"', encoding="utf-8")
+        with self.assertRaises(json.JSONDecodeError):
+            store.claim(self._signal(), operating_mode=models.MODE_OBSERVE)
+
+    def test_a_corrupt_index_is_left_exactly_as_it_was(self):
+        """The point of refusing: the salvageable bytes must survive on disk."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import models, store
+
+        truncated = '{"INV-1": {"incident_id": "INV-1", "status": "dispatched"'
+        store.index_path().write_text(truncated, encoding="utf-8")
+
+        with contextlib.suppress(json.JSONDecodeError):
+            store.claim(self._signal(), operating_mode=models.MODE_OBSERVE)
+
+        self.assertEqual(
+            store.index_path().read_text(encoding="utf-8"),
+            truncated,
+            "the refused mutation still overwrote the recoverable document",
+        )
+
+    def test_the_display_read_still_tolerates_corruption(self):
+        """The asymmetry, pinned. Only the MUTATION base got strict.
+
+        The board must still render on a corrupt index -- failing the route would
+        turn a recoverable file into an unusable app, which is the opposite of the
+        point. So `read_index` keeps collapsing to empty (and now logs why).
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import store
+
+        store.index_path().write_text("{ not json", encoding="utf-8")
+        self.assertEqual(store.read_index(), {})
+
+    def test_a_skipped_entry_is_not_silently_deleted_by_the_next_mutation(self):
+        """Normalization was the second door into the same data loss.
+
+        `_coerce_index` skips a value that is not an object -- and skipped it with no log
+        at all, unlike the unloadable-row case beside it. On the display read that is
+        right: one bad row must not blank the board. On the update path it is the whole
+        bug in miniature, because the mutation rewrites the file from what the reader
+        returned, so a skipped row is deleted from disk permanently with no error and no
+        parse failure to notice. Found in review (GPT 5.6) -- the strict reader had closed
+        the malformed-JSON door and left this one open.
+
+        The fixture uses a non-object VALUE rather than an unloadable one because that is
+        the reachable half: `Incident.from_dict` coerces every field through `str()` and
+        type guards, so it essentially never raises for a dict. Strict mode covers that
+        path too, but this is the one a hand-edit or a merge artifact actually produces.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import models, store
+
+        good = store.claim(self._signal(native_id="alarm/keep"), operating_mode=models.MODE_OBSERVE)
+        assert good is not None
+        raw = json.loads(store.index_path().read_text(encoding="utf-8"))
+        raw["INV-BROKEN"] = "this row is not an object"
+        store.index_path().write_text(json.dumps(raw), encoding="utf-8")
+        before = store.index_path().read_text(encoding="utf-8")
+
+        with self.assertRaises(json.JSONDecodeError):
+            store.claim(self._signal(native_id="alarm/new"), operating_mode=models.MODE_OBSERVE)
+
+        self.assertEqual(
+            store.index_path().read_text(encoding="utf-8"),
+            before,
+            "the mutation deleted a row it merely could not read",
+        )
+        self.assertIn("INV-BROKEN", store.index_path().read_text(encoding="utf-8"))
+
+    def test_an_index_that_is_valid_json_but_not_an_object_refuses_the_mutation(self):
+        """`[]` parses fine, so no JSONDecodeError fires -- but it is still not a document
+        a whole-file rewrite may be based on."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import models, store
+
+        store.index_path().write_text("[]", encoding="utf-8")
+
+        with self.assertRaises(json.JSONDecodeError):
+            store.claim(self._signal(), operating_mode=models.MODE_OBSERVE)
+
+        self.assertEqual(store.index_path().read_text(encoding="utf-8"), "[]")
+
+    def test_both_corruption_doors_raise_the_named_type(self):
+        """The reader's contract: every refusal is ONE exception type, either door.
+
+        Review observed that `CorruptDocumentError` was a subclass no catcher distinguished
+        (First Principles). That was fair, and it applied to the tests too -- every corruption
+        test here asserts the BASE `json.JSONDecodeError`, so nothing would have noticed the
+        reader handing back a bare base instance. This pins the type itself, so the subclass
+        is the reader's contract rather than decoration at the raise site.
+
+        Both doors are checked because they arrive differently: a bad byte stream comes from
+        `json.loads` and is re-raised, while a bad shape is constructed in `_coerce_index`.
+        Catchers written against `json.JSONDecodeError` keep working either way -- asserted
+        here too, since that compatibility is the whole reason for subclassing.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import models, store
+
+        for label, content in (
+            ("unparseable bytes", "{ not json"),
+            ("valid JSON, wrong shape", "[]"),
+        ):
+            with self.subTest(door=label):
+                store.index_path().write_text(content, encoding="utf-8")
+                with self.assertRaises(models.CorruptDocumentError):
+                    store.claim(self._signal(), operating_mode=models.MODE_OBSERVE)
+                # The base class still catches it; that is why the subclass is safe.
+                store.index_path().write_text(content, encoding="utf-8")
+                with self.assertRaises(json.JSONDecodeError):
+                    store.claim(self._signal(), operating_mode=models.MODE_OBSERVE)
+
+    def test_the_display_read_still_tolerates_a_skipped_entry(self):
+        """The asymmetry again: one unreadable row must not blank the whole board."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import models, store
+
+        good = store.claim(self._signal(native_id="alarm/keep"), operating_mode=models.MODE_OBSERVE)
+        assert good is not None
+        raw = json.loads(store.index_path().read_text(encoding="utf-8"))
+        raw["INV-BROKEN"] = "this row is not an object"
+        store.index_path().write_text(json.dumps(raw), encoding="utf-8")
+
+        self.assertEqual(sorted(store.read_index()), [good.incident_id])
+
+    def test_a_raising_read_still_releases_the_index_lock(self):
+        """ "Raise while holding `_IndexLock`" became reachable for the first time here.
+
+        `_read_index_unlocked` never raised -- it swallowed every failure -- so before
+        this change no mutation could leave the `with _IndexLock():` block by exception,
+        and nothing had to be exception-safe about the release. Now the strict read can
+        raise inside that block on every one of the six mutations.
+
+        If the release were not exception-safe the app would WEDGE rather than error:
+        every later mutation would block forever on a lock nobody holds, and `flock` is
+        per-descriptor so the same process deadlocks against itself. That is a worse
+        outcome than the data loss this PR fixes, and it is the one thing the change puts
+        at risk that no existing test could reach. Asserted behaviourally -- a second
+        mutation must complete -- so a regression shows up as a hang under CI's timeout
+        rather than as a passing test.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import models, store
+
+        inc = store.claim(self._signal(), operating_mode=models.MODE_OBSERVE)
+        assert inc is not None
+
+        with self._unreadable_index():
+            with self.assertRaises(OSError):
+                store.transition(inc.incident_id, models.STATUS_INVESTIGATING)
+
+        # The lock must be free again, on the very next attempt.
+        moved = store.transition(inc.incident_id, models.STATUS_INVESTIGATING)
+        self.assertEqual(moved.status, models.STATUS_INVESTIGATING)
+        # ...and the index must still hold exactly the one incident, not a second copy.
+        self.assertEqual(list(store.read_index()), [inc.incident_id])

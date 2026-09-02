@@ -18,6 +18,7 @@ is set.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -183,6 +184,46 @@ def _audit(op: str, target: str, outcome: str, *, error: str = "") -> None:
         outcome=outcome,
         resources=target,
         error=error,
+    )
+
+
+def _store_read_refusal(exc: Exception, *, code: str) -> web.Response:
+    """Map a strict reader's refusal to a coded response.
+
+    The store and config readers now refuse rather than publishing a mutation over a
+    read they could not make, so every handler that mutates them can see two failures
+    that previously could not happen. They get DIFFERENT statuses because the operator's
+    next move differs: an unreadable file is transient, so 503 correctly says "retry",
+    while a corrupt one needs a person to repair it, so 503 would send them at something
+    that cannot succeed and 500 is the honest answer.
+
+    Centralized because four handlers need the identical pair, and three review lanes
+    independently flagged that translating it at some of them and not others is worse
+    than not translating it anywhere -- an operator cannot tell a route that reports the
+    condition from one that swallows it.
+
+    ``JSONDecodeError`` MUST be matched before any ``ValueError`` arm at the call site.
+    It is a `ValueError` subclass, so an existing arm for a domain error will otherwise
+    claim it and report corruption as that domain error -- which is the same accident
+    this change fixes in `verify_pending_actions`, `reconcile` and
+    `_schedule_verification`.
+    """
+    if isinstance(exc, json.JSONDecodeError):
+        return web.json_response(
+            {
+                "ok": False,
+                "error": "the stored document is unreadable and must be repaired",
+                "code": f"{code}_corrupt",
+            },
+            status=500,
+        )
+    return web.json_response(
+        {
+            "ok": False,
+            "error": "the store is not readable right now; try again",
+            "code": f"{code}_unreadable",
+        },
+        status=503,
     )
 
 
@@ -545,6 +586,14 @@ async def _handle_transition(request: web.Request) -> web.StreamResponse:
         return web.json_response(
             {"error": "unknown incident", "code": "unknown_incident"}, status=404
         )
+    except (json.JSONDecodeError, OSError) as exc:
+        # BEFORE the `ValueError` arm, and that order is the whole point: a corrupt index
+        # was being reported as `409 illegal_transition` carrying the JSON parser's message
+        # -- corruption misclassified as the operator making an illegal move, which sends
+        # them to fix their own request instead of the file. Found in review (Opus 4.8),
+        # and it is the same `JSONDecodeError`-under-`ValueError` accident this change
+        # already closed at three other callers.
+        return _store_read_refusal(exc, code="dispatch_index")
     except ValueError as exc:
         # An illegal transition is a client error, not a server fault.
         return web.json_response({"error": str(exc), "code": "illegal_transition"}, status=409)
@@ -671,9 +720,16 @@ async def _handle_claim(request: web.Request) -> web.StreamResponse:
     mode = rotation.resolve_mode(signal)
     # `operator`, not the heartbeat default: this route IS the board's manual claim,
     # and telling the two apart afterwards is the whole point of the field.
-    incident = await asyncio.to_thread(
-        store.claim, signal, operating_mode=mode, claimed_by=CLAIMED_BY_OPERATOR
-    )
+    try:
+        incident = await asyncio.to_thread(
+            store.claim, signal, operating_mode=mode, claimed_by=CLAIMED_BY_OPERATOR
+        )
+    except (json.JSONDecodeError, OSError) as exc:
+        # `claim` raises on both failures by design -- a compare-and-set has no safe
+        # degraded answer, since `None` already means "another instance owns this signal".
+        # The board's manual claim therefore needs the same coded translation as its
+        # siblings; unwrapped it answered a bare 500. Found in review (Opus 4.8).
+        return _store_read_refusal(exc, code="dispatch_index")
     if incident is None:
         return web.json_response(
             {"error": "signal is already claimed", "code": "signal_already_claimed"}, status=409
@@ -930,6 +986,33 @@ def _schedule_verification(incident_id: str, action: str, duration_secs: Any) ->
             verification=verdict,
             verification_detail="",
         )
+    except json.JSONDecodeError:
+        # Corruption gets its OWN handler here, but it must NOT raise. Both callers have
+        # ALREADY performed the real external write by the time this runs (`result.ok and
+        # not result.simulated`), so raising turns a successful action into a 500 and invites
+        # the operator to retry it -- in `act` mode that is a second real write against their
+        # production tooling. Found in review: Design Review caught that corruption was
+        # silently swallowed by the clause below (`JSONDecodeError` subclasses `ValueError`),
+        # and GPT 5.6 then caught that re-raising misreports a completed action. Neither
+        # remedy alone is right.
+        #
+        # So it is REPORTED rather than either swallowed or raised: its own clause, an
+        # exception log, and a SEL audit entry recording that the action ran with no
+        # verification scheduled. That is the same choice #7788 made for a partial ceiling
+        # apply in this file -- the audit log is the durable reader, and unlike a new
+        # `verification` value it needs no vocabulary the dashboard cannot render. The
+        # persistence argument still holds (corruption never self-heals), which is why it is
+        # audited as a failure rather than folded into the tolerant arm.
+        logger.exception(
+            "ops-mission-control: index corrupt, verification not scheduled for %s", incident_id
+        )
+        _audit(
+            "action_verification_unscheduled",
+            incident_id,
+            "failure",
+            error="index corrupt; action executed with no recheck scheduled",
+        )
+        return "", ""
     except (KeyError, ValueError, OSError):
         logger.exception("ops-mission-control: could not schedule verification for %s", incident_id)
         return "", ""
@@ -1242,6 +1325,17 @@ async def _handle_propose(request: web.Request) -> web.StreamResponse:
         return web.json_response(
             {"error": "unknown incident", "code": "unknown_incident"}, status=404
         )
+    except (json.JSONDecodeError, OSError) as exc:
+        # BEFORE the `ValueError` arm. `propose_action` reaches the strict reader through
+        # `update_fields` -> `transition` -> `_read_index_for_update()`, so a corrupt index
+        # raises `CorruptDocumentError`, which IS a `ValueError` -- and the arm below would
+        # report it as `400 invalid_proposal`. That is worse than the bare 500 it replaces:
+        # a 400 tells the operator their proposal was malformed, so they re-type the form
+        # while the real fault sits on disk untouched. Found by auditing every
+        # `ValueError`-family arm in this file against the rule stated on
+        # `_store_read_refusal`; this was the only one of ten that could reach a strict
+        # reader and did not already have this clause.
+        return _store_read_refusal(exc, code="dispatch_index")
     except ValueError as exc:
         return web.json_response({"error": str(exc), "code": "invalid_proposal"}, status=400)
 
@@ -1297,6 +1391,14 @@ async def _handle_decide_proposal(request: web.Request) -> web.StreamResponse:
         return web.json_response(
             {"error": "unknown incident", "code": "unknown_incident"}, status=404
         )
+    except (json.JSONDecodeError, OSError) as exc:
+        # `decide_proposal` is a locked read-modify-write that now refuses rather than
+        # publishing over a failed read. Previously this could only answer a coded 404, so
+        # both new failures became a bare 500. The request is a human's approval of a
+        # production action, so "did my approval land?" must not be ambiguous.
+        logger.warning("ops-mission-control: proposal decision refused for %s", incident_id)
+        _audit("incident_proposal_decide", incident_id, "failure", error="index unreadable")
+        return _store_read_refusal(exc, code="dispatch_index")
     if not decision["ok"]:
         _audit("incident_proposal_decide", incident_id, "rejected", error=decision["reason"])
         return web.json_response(
@@ -1494,7 +1596,17 @@ async def _handle_put_provider_config(request: web.Request) -> web.StreamRespons
             {"error": "no config fields supplied", "code": "no_recognized_fields"}, status=400
         )
 
-    saved = await asyncio.to_thread(merge_provider_config, provider_id, updates)
+    # `merge_provider_config` refuses rather than publishing over a read it could not make,
+    # so this call can raise both failures. Routed through the shared mapper rather than
+    # answering here: hand-rolling a second response pair beside the helper built for
+    # exactly this was flagged in review (First Principles), and it was right -- two sites
+    # constructing the same two responses is how their statuses drift apart.
+    try:
+        saved = await asyncio.to_thread(merge_provider_config, provider_id, updates)
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("ops-mission-control: provider config write refused (%s)", provider_id)
+        _audit("provider_config_put", f"{provider_id}:{sorted(updates)}", "failure")
+        return _store_read_refusal(exc, code="app_config")
     _audit("provider_config_put", f"{provider_id}:{sorted(updates)}", "success")
     return web.json_response({"ok": True, "provider": provider_id, "config": saved})
 
@@ -1538,6 +1650,23 @@ async def _settings_write_or_refuse(
     """
     try:
         await asyncio.to_thread(fn, *args, **kwargs)
+    except json.JSONDecodeError as exc:
+        # `set_top_level` reaches the app config, whose update reader now refuses on a
+        # malformed document -- so this helper, which caught only `OSError`, let the bare
+        # 500 back in for exactly the store the docstring above said the companion PR would
+        # make strict. That companion PR is this one, so the hole opened here the moment the
+        # reader landed. Found in review (First Principles).
+        #
+        # The response comes from the shared mapper rather than being built here, so this
+        # helper and the four route-level sites cannot drift on either status.
+        logger.warning("ops-mission-control: settings write refused, document corrupt (%s)", code)
+        _audit("settings_put", f"refused after {sorted(applied)}", "failure")
+        # The caller's code names the WRITE being refused (`policy_store_unwritable`), which
+        # is right for the `OSError` arm below and merged behaviour there. For corruption the
+        # suffix would double up into `..._unwritable_corrupt`, so the base noun is taken and
+        # the mapper names the condition: `policy_store_corrupt`.
+        base = code[: -len("_unwritable")] if code.endswith("_unwritable") else code
+        return _store_read_refusal(exc, code=base)
     except OSError as exc:
         logger.warning("ops-mission-control: settings write refused (%s)", code)
         _audit("settings_put", f"refused after {sorted(applied)}", "failure")
@@ -2236,7 +2365,20 @@ async def _handle_ledger_hygiene(request: web.Request) -> web.StreamResponse:
     # Retire old CLOSED incidents. Here rather than on the claim path because pruning is
     # maintenance: doing it in `claim` would make an ordinary claim occasionally pay for a
     # large rewrite. Open work is never pruned, whatever the age.
-    incidents_pruned = await asyncio.to_thread(store.prune_closed)
+    #
+    # Degraded rather than fatal, for the same reason `dispatch.run_cycle`'s maintenance
+    # passes are: `prune_closed` now propagates a failed index read, and it sits BEFORE the
+    # push below. Letting it escape would mean one EACCES on this cron skips pushing the
+    # ledger that `hygiene` just deduped -- a later fault costing an earlier step's work.
+    # Pruning is the most deferrable thing here (the next run retires the same incidents),
+    # while the push is what other instances are waiting on. A corrupt index is deliberately
+    # NOT caught: that never self-heals, so it must stop the cron loudly instead of quietly
+    # skipping the prune on every future run.
+    try:
+        incidents_pruned = await asyncio.to_thread(store.prune_closed)
+    except OSError:
+        logger.exception("ops-mission-control: could not prune closed incidents; skipping")
+        incidents_pruned = 0
     pushed = await ledger_sync.sync_safely(direction="push")
 
     changed = any(summary.get(k) for k in ("deduped", "decayed", "pruned"))
