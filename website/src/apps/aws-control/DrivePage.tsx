@@ -23,7 +23,7 @@
  * react-query key. All AWS access runs through the gateway's audited CLI
  * chokepoint; this surface never talks to AWS from the browser.
  */
-import { Fragment, useEffect, useRef, useState } from 'react'
+import { Fragment, useRef, useState } from 'react'
 import { useQuery, useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { Trans } from 'react-i18next'
@@ -275,6 +275,120 @@ function OrphanThumb() {
 function LibrarySection({ account, bucket }: { account: string; bucket: string }) {
   const [mode, setMode] = useViewMode('library', 'grid')
   const [picking, setPicking] = useState(false)
+  const qc = useQueryClient()
+
+  /* Removal lives HERE, on the listing of what is actually in the bucket, and
+     the state for it is the SECTION's rather than each card's.
+
+     Both halves of that are load-bearing. The listing's rows come from
+     `driveList`, so a row IS a cloud folder and removing its slug empties the
+     object the reader was shown -- identity by construction. The picker beside
+     it cannot say that: its rows are local artifacts joined to a slug-keyed
+     ledger, so a reused slug lends a never-pushed artifact another one's push
+     record and a removal there empties a DIFFERENT artifact's copy (#6987).
+
+     Holding `confirmSlug` at the section makes only one confirm openable at a
+     time and, more importantly, leaves nowhere for a per-card confirm flag to
+     go stale: a card exists exactly while its object is listed, and a
+     successful removal invalidates the listing, so the card and its strip
+     unmount together. What keeps one row's outcome off another row is NOT this
+     state but the slug keying below -- see `errorFor`. */
+  const [confirmSlug, setConfirmSlug] = useState<string | null>(null)
+  /* The slug whose removal FAILED, so an outcome belongs to the row that asked
+     for it rather than to whichever row touched the mutation last.
+     
+     One `useMutation` is right for FIRING the request; what cannot work is a
+     single observer owning the OUTCOME. Its `isError` is one slot for the whole
+     section, so with two cards in play every interleaving loses one of them, and
+     each direction patched leaves another:
+     
+       old -> new   A completes and its callback closes B's confirm. Fixed by the
+                    ownership guard in `onSuccess` below.
+       new -> old   opening B called `removeMut.reset()`, which THREW AWAY A's
+                    in-flight state, so when A failed its error had nowhere to
+                    render: the removal silently did not happen and nothing on
+                    screen said so.
+     
+     The reset is gone and the failure is keyed by slug instead. Both directions
+     close at once because neither row can reach the other's outcome, and no
+     interaction is forbidden -- which is why this is preferred over refusing to
+     open a confirm while a sibling removal is in flight (a Remove item that does
+     nothing when clicked is a worse defect than the one it patches). */
+  const [errorFor, setErrorFor] = useState<string | null>(null)
+  /** Clear a slug-keyed slot only if it still holds THIS slug. */
+  const clearIf = (slug: string) => (cur: string | null) => (cur === slug ? null : cur)
+  const removeMut = useMutation({
+    mutationFn: (slug: string) => awsControlApi.libraryRemove(account, slug),
+    // A retry of this slug retires its own previous failure, and only its own.
+    onMutate: (slug: string) => setErrorFor(clearIf(slug)),
+    onSuccess: (_data, slug) => {
+      /* Clear the confirm ONLY if it is still this removal's. A `delete_prefix`
+         sweep over several S3 objects is not instant, so the interleave needs
+         nothing unusual: remove A, open B's confirm while A is still running, and
+         an unconditional `setConfirmSlug(null)` closes B when A lands -- a
+         removal the reader was about to confirm silently vanishes because an
+         unrelated one finished. */
+      setConfirmSlug(clearIf(slug))
+      // Both keys, for the same reason the push path invalidates both: the
+      // PREFIX lost its objects (this listing) and the ledger forgot the record
+      // (the local join that names these cards). Unconditional: the bucket
+      // changed whether or not this row's confirm is still open.
+      qc.invalidateQueries({ queryKey: ['aws-control', 'drive', account] })
+      qc.invalidateQueries({ queryKey: ['aws-control', 'library', account] })
+    },
+    onError: (_err, slug: string) => setErrorFor(slug),
+  })
+  // No reset: opening a confirm must not discard another row's in-flight state.
+  const askRemove = (slug: string) => setConfirmSlug(slug)
+  /* Which slug the request is actually running for. Derived rather than stored:
+     with the reset gone, `variables` is the slug of the live mutation, so an
+     unscoped `isPending` would render "Removing" and a DISABLED Cancel inside a
+     sibling's strip -- leaving a reader who opened B unable to close it. */
+  const pendingFor = removeMut.isPending ? removeMut.variables : undefined
+  /** The strip's props for one slug, so grid and list cannot drift apart. */
+  const confirmFor = (slug: string, title: string) => ({
+    label: (
+      <>
+        {i18nT('apps.awsControl.console.library_remove_confirm', { name: title })}{' '}
+        {/* NOT text-muted. This sentence is the identity the reader checks the
+            delete against -- it names the bucket folder that will actually be
+            emptied, which is the whole mitigation for a slug the local ledger
+            cannot vouch for. Muting it styles the load-bearing half of the
+            confirm as an aside and undercuts the argument the placement rests
+            on (UX review on #7026). */}
+        <span className="text-text">
+          {/* One key carries the whole sentence and names the monospace chip with
+              a `<folder>` tag, rather than a lead-in string plus a sibling
+              <code>: a split hands the translator a fragment they cannot reorder
+              around their own word order. Kept from #7026 verbatim.
+
+              The literal is the BUCKET key prefix (`artifacts/`, what
+              SECTION_PREFIXES['library'] resolves to), not the `library/` API
+              route segment -- a path that does not exist in the bucket cannot be
+              cross-checked in the S3 console, which is the only place the
+              wrong-target case is catchable. */}
+          <Trans
+            i18nKey="apps.awsControl.console.library_remove_confirm_slug"
+            values={{ folder: `artifacts/${slug}/` }}
+            components={{ folder: <code className="text-[11px] text-text" /> }}
+          />
+        </span>
+      </>
+    ),
+    /* The failure renders on the CARD, not here, so it belongs to the row that
+       asked for it whichever strip happens to be open -- see `errorFor`. */
+    error: '',
+    pending: pendingFor === slug,
+    // Cancel retires this row's failure with the attempt it describes, and only
+    // this row's: backing out should not leave a standing red beside a copy that
+    // is still there, nor touch a sibling's.
+    onCancel: () => { setConfirmSlug(null); setErrorFor(clearIf(slug)) },
+    onConfirm: () => removeMut.mutate(slug),
+    action: pendingFor === slug
+      ? i18nT('apps.awsControl.console.library_removing')
+      : i18nT('apps.awsControl.console.library_remove_action'),
+    testId: 'library-remove-confirm',
+  })
 
   /* What is in the cloud, ACCUMULATED across pages. A plain query keyed by the
      continuation token replaced the visible page on every "Load more", which is
@@ -316,11 +430,16 @@ function LibrarySection({ account, bucket }: { account: string; bucket: string }
     if (a.pushedAt !== null) bySlug.set(a.slug, a)
   }
   /* Whether the local library ACTUALLY answered. Until it has, `bySlug` is empty
-     and every cloud object looks orphaned -- which would present each one as
-     cloud-only AND offer it the orphan-only removal, the exact ledger-stranding
-     path that removal is restricted to avoid. A pending or failed lookup is not
-     the answer "there is no local copy", so nothing may be concluded from a miss
-     until this is true. */
+     and every cloud object looks orphaned -- so a card would assert "in the
+     cloud only" on the strength of a lookup that has not returned, and borrow
+     neither name, kind nor preview from a copy that does exist. A pending or
+     failed lookup is not the answer "there is no local copy", so nothing may be
+     concluded from a miss until this is true.
+
+     It gates only what a card CLAIMS, never whether it can be removed. Removal
+     targets the slug this listing returned, which is in the bucket whatever the
+     local lookup did, and gating it on local state is what made a copy pushed
+     from another machine unremovable in the first place. */
   const localAnswered = localQ.isSuccess
 
   const slugs = (listQ.data?.pages ?? []).flatMap((pg) => pg.folders.map((f) => f.split('/').pop() ?? f))
@@ -446,6 +565,9 @@ function LibrarySection({ account, bucket }: { account: string; bucket: string }
                 slug={slug}
                 local={bySlug.get(slug)}
                 localAnswered={localAnswered}
+                confirm={confirmSlug === slug ? confirmFor(slug, bySlug.get(slug)?.name || slug) : null}
+                failed={errorFor === slug}
+                onAskRemove={() => askRemove(slug)}
               />
             ))}
           </div>
@@ -503,22 +625,65 @@ function LibrarySection({ account, bucket }: { account: string; bucket: string }
                instead of shoving the badge past the viewport edge. At any
                normal width nothing wraps and the row is unchanged. */
             const ROW = 'flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2.5 text-[13px]'
+            const title = local?.name || slug
             /* Same split as the cards: only a row with a local copy behind it has
                an artifact page to open, so a cloud-only row stays inert rather
                than linking somewhere that would 404. */
-            return local ? (
+            const RowBody = local ? (
               <Link
-                key={slug}
                 to={`/artifacts/${slug}`}
-                aria-label={i18nT('apps.awsControl.console.library_open', { name: local.name || slug })}
-                className={`${ROW} transition-colors hover:bg-bg-hover`}
+                aria-label={i18nT('apps.awsControl.console.library_open', { name: title })}
+                className={`${ROW} min-w-0 flex-1 transition-colors hover:bg-bg-hover`}
                 data-testid="library-list-row"
               >
                 {RowInner}
               </Link>
             ) : (
-              <div key={slug} className={ROW} data-testid="library-list-row">
+              <div className={`${ROW} min-w-0 flex-1`} data-testid="library-list-row">
                 {RowInner}
+              </div>
+            )
+            /* A view is a way of LOOKING at this folder, not a capability tier,
+               so the row carries the same overflow menu the card carries -- and
+               the choice PERSISTS per section, so leaving it out would mean a
+               reader who once switched to the list can never remove a copy
+               again. Same trigger shape as the Files folder's own rows
+               (`drive-more`), and the trigger sits OUTSIDE the row's link for
+               the reason the card's does: interactive content inside an anchor
+               is invalid, and nesting it would put a destructive path inside the
+               navigation the rest of the row performs. */
+            return (
+              <div key={slug}>
+                <div className="flex items-center gap-1 pr-2">
+                  {RowBody}
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <button
+                        type="button"
+                        className="cursor-pointer rounded border-none bg-transparent p-1 text-muted transition-colors hover:text-text"
+                        aria-label={i18nT('apps.awsControl.console.library_actions')}
+                        data-testid="library-more"
+                      >
+                        <MoreHorizontal size={14} />
+                      </button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem onSelect={() => askRemove(slug)} data-testid="library-remove">
+                        <Trash2 size={13} />{i18nT('apps.awsControl.console.library_remove')}
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
+                {errorFor === slug && (
+                  <p className="px-3 pb-2 text-[11px] leading-snug text-danger" data-testid="library-remove-error">
+                    {i18nT('apps.awsControl.console.library_remove_failed')}
+                  </p>
+                )}
+                {confirmSlug === slug && (
+                  <div className="px-3 pb-2.5">
+                    <TileConfirm {...confirmFor(slug, title)} />
+                  </div>
+                )}
               </div>
             )
           })}
@@ -553,23 +718,35 @@ function LibrarySection({ account, bucket }: { account: string; bucket: string }
  * menu click reads as a no-op while a live destructive control sits parked out
  * of sight.
  */
-function TileConfirm({ label, error, pending, onCancel, onConfirm, action }: {
-  label: string
+function TileConfirm({ label, error, pending, onCancel, onConfirm, action, testId = 'drive-grid-confirm' }: {
+  /* A NODE, not a string: the library's removal names the cloud folder it will
+     empty, and a bucket path belongs in a <code> chip inside the sentence rather
+     than flattened into it. Every existing caller passes a string, which is a
+     ReactNode. */
+  label: React.ReactNode
   error: string
   pending: boolean
   onCancel: () => void
   onConfirm: () => void
   action: string
+  /* The base for this strip's test ids, so a second caller is addressable as
+     itself. Defaults to the drive's, which keeps every existing id unmoved. */
+  testId?: string
 }) {
   return (
-    <div className="mt-1 w-full border-t border-border pt-2" data-testid="drive-grid-confirm">
+    <div className="mt-1 w-full border-t border-border pt-2" data-testid={testId}>
       <p className="mb-2 text-[12px] leading-snug text-text">{label}</p>
-      {error && <p className="mb-2 text-[11px] text-danger" data-testid="drive-grid-confirm-error">{error}</p>}
+      {error && <p className="mb-2 text-[11px] text-danger" data-testid={`${testId}-error`}>{error}</p>}
       <div className="flex flex-wrap items-center gap-2">
-        <Btn onClick={onCancel} data-testid="drive-grid-confirm-cancel">
+        {/* Disabled while the request runs, and that is a correctness rule rather
+            than polish: this strip is the ONLY place the outcome can render, so
+            dismissing it mid-flight throws away the answer to a destructive
+            request that is still in progress -- the reader is told nothing, and a
+            failure that left the copy in place looks identical to a success. */}
+        <Btn onClick={onCancel} disabled={pending} data-testid={`${testId}-cancel`}>
           {i18nT('apps.awsControl.console.cancel')}
         </Btn>
-        <Btn danger disabled={pending} onClick={onConfirm} data-testid="drive-grid-confirm-action">
+        <Btn danger disabled={pending} onClick={onConfirm} data-testid={`${testId}-action`}>
           <Trash2 size={13} />{action}
         </Btn>
       </div>
@@ -578,10 +755,16 @@ function TileConfirm({ label, error, pending, onCancel, onConfirm, action }: {
 }
 
 /** One artifact that IS in the cloud, as a preview card. */
-function LibraryCloudCard({ slug, local, localAnswered }: {
+function LibraryCloudCard({ slug, local, localAnswered, confirm, failed, onAskRemove }: {
   slug: string
   local: LibraryArtifact | undefined
   localAnswered: boolean
+  /** The open confirm's props, or null when this card's confirm is closed. */
+  confirm: React.ComponentProps<typeof TileConfirm> | null
+  /** Whether THIS card's own removal failed. Keyed by slug, so a sibling's
+      failure never renders here and opening a sibling never erases it. */
+  failed: boolean
+  onAskRemove: () => void
 }) {
   /* With no local artifact behind it the name IS the slug, so printing both puts
      the same string on the card twice. */
@@ -639,7 +822,7 @@ function LibraryCloudCard({ slug, local, localAnswered }: {
     </>
   )
 
-  const SHELL = 'mb-3 mr-3 block overflow-hidden rounded-lg border border-border bg-card'
+  const SHELL = 'relative mb-3 mr-3 overflow-hidden rounded-lg border border-border bg-card'
   /* A card backed by a local copy has somewhere to go: the artifact's own page.
      A cloud-only card does NOT -- there is no local artifact to open -- so it
      stays inert rather than offering a link that would 404, and it keeps the flat
@@ -649,22 +832,88 @@ function LibraryCloudCard({ slug, local, localAnswered }: {
      A real <Link> rather than a click handler: middle-click, cmd-click and
      keyboard activation all come for free, and there is no nested-control
      hijack to guard against. */
-  if (!local) {
-    return (
-      <div className={SHELL} data-testid="library-card">
-        {body}
-      </div>
-    )
-  }
-  return (
+  const openable = local ? (
     <Link
       to={`/artifacts/${slug}`}
       aria-label={i18nT('apps.awsControl.console.library_open', { name: title })}
-      className={`${SHELL} transition-colors hover:border-border-strong hover:bg-bg-hover`}
-      data-testid="library-card"
+      className="block transition-colors hover:bg-bg-hover"
     >
       {body}
     </Link>
+  ) : (
+    <div>{body}</div>
+  )
+  /* The shell is a <div> and the LINK is inside it, rather than the shell being
+     the link. That is what lets the overflow trigger be a real <button>: a button
+     inside an anchor is invalid content, and a trigger that had to
+     `preventDefault` its way out of the surrounding navigation is the kind of
+     nested-control hijack the file avoids elsewhere. Splitting them keeps
+     cmd-click and middle-click working on everything a reader would click to
+     OPEN the artifact, and keeps the destructive path out of that target. */
+  return (
+    <div className={SHELL} data-testid="library-card">
+      {openable}
+      {/* Per-item actions live in ONE overflow menu, the same shape the Files
+          folder's own cards use (`drive-grid-more`): same MoreHorizontal
+          trigger, same DropdownMenu primitives, same align="end", and the
+          destructive item still lands as a TileConfirm strip below rather than
+          firing from the menu. A visible danger button on every card of a
+          browse surface was the design this replaces -- a reader moving between
+          the two folders met two different grammars for "act on this item".
+
+          Positioned over the preview rather than in the body row, because the
+          body is inside the link and this must not be. It is always visible
+          rather than hover-revealed: a hover-only control is unreachable by
+          touch and invisible to anyone scanning the card for what they can do.
+
+          The menu holds one item today. That is deliberate -- Share and
+          Download for a library object would need presigned reads on the
+          library prefix, which this change does not add -- and the menu is
+          where they land when they exist, instead of a second control
+          appearing beside it. */}
+      <div className="absolute right-2 top-2">
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              className="cursor-pointer rounded border-none bg-card/85 p-1 text-muted backdrop-blur-sm transition-colors hover:text-text"
+              aria-label={i18nT('apps.awsControl.console.library_actions')}
+              data-testid="library-more"
+            >
+              <MoreHorizontal size={14} />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            {/* Offered on EVERY listed object, including one with no local row.
+                Those are the copies pushed from another machine, and they are
+                the reason this control had to move off the picker: the picker
+                could only ever reach local artifacts, so a copy from elsewhere
+                was unremovable while a locally reused slug could remove the
+                wrong one -- exactly backwards from what the spec asks of a
+                console "that must be able to remove it". Nothing here is gated
+                on local state, because the object's presence in this listing is
+                not. */}
+            <DropdownMenuItem onSelect={onAskRemove} data-testid="library-remove">
+              <Trash2 size={13} />{i18nT('apps.awsControl.console.library_remove')}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+      {/* On the CARD rather than inside the strip, because the failure belongs to
+          this copy whichever confirm happens to be open -- a reader who started
+          this removal and then looked at another card still sees that it did not
+          happen, instead of being told nothing at all. */}
+      {failed && (
+        <p className="px-3 pb-2 text-[11px] leading-snug text-danger" data-testid="library-remove-error">
+          {i18nT('apps.awsControl.console.library_remove_failed')}
+        </p>
+      )}
+      {confirm && (
+        <div className="px-3 pb-3">
+          <TileConfirm {...confirm} />
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -720,10 +969,6 @@ function AddFromArtifactsDialog({ account, onClose }: { account: string; onClose
    */
   const [addingSlugs, setAddingSlugs] = useState<ReadonlySet<string>>(new Set())
   const [failedSlugs, setFailedSlugs] = useState<ReadonlySet<string>>(new Set())
-  // Removals share the per-slug discipline for the same reason: a removal's
-  // outcome must not depend on another removal (or an add) being in flight.
-  const [removingSlugs, setRemovingSlugs] = useState<ReadonlySet<string>>(new Set())
-  const [removeFailedSlugs, setRemoveFailedSlugs] = useState<ReadonlySet<string>>(new Set())
   const withoutSlug = (set: ReadonlySet<string>, slug: string) => {
     const next = new Set(set)
     next.delete(slug)
@@ -745,23 +990,6 @@ function AddFromArtifactsDialog({ account, onClose }: { account: string; onClose
       setFailedSlugs((prev) => new Set(prev).add(slug))
     } finally {
       setAddingSlugs((prev) => withoutSlug(prev, slug))
-    }
-  }
-  const removeOne = async (slug: string) => {
-    setRemovingSlugs((prev) => new Set(prev).add(slug))
-    setRemoveFailedSlugs((prev) => withoutSlug(prev, slug))
-    try {
-      await awsControlApi.libraryRemove(account, slug)
-      // Same two keys as addOne: the ledger forgot the record AND the folder
-      // behind this dialog lost the artifact's objects.
-      qc.invalidateQueries({ queryKey: ['aws-control', 'library', account] })
-      qc.invalidateQueries({ queryKey: ['aws-control', 'drive', account] })
-    } catch {
-      // The failure must render (delete_failed on the card): a confirm strip that
-      // closes before the outcome is known reports a delete that never happened.
-      setRemoveFailedSlugs((prev) => new Set(prev).add(slug))
-    } finally {
-      setRemovingSlugs((prev) => withoutSlug(prev, slug))
     }
   }
 
@@ -913,10 +1141,6 @@ function AddFromArtifactsDialog({ account, onClose }: { account: string; onClose
                     onPush={() => { void addOne(a.slug) }}
                     pushing={addingSlugs.has(a.slug)}
                     failed={failedSlugs.has(a.slug)}
-                    onRemove={() => { void removeOne(a.slug) }}
-                    onCancelRemove={() => { setRemoveFailedSlugs((prev) => withoutSlug(prev, a.slug)) }}
-                    removing={removingSlugs.has(a.slug)}
-                    removeFailed={removeFailedSlugs.has(a.slug)}
                   />
                 ))}
               </div>
@@ -930,16 +1154,12 @@ function AddFromArtifactsDialog({ account, onClose }: { account: string; onClose
 
 /** One candidate in the picker: a real preview, and one action. */
 function PickerCard({
-  artifact, onPush, pushing, failed, onRemove, onCancelRemove, removing, removeFailed,
+  artifact, onPush, pushing, failed,
 }: {
   artifact: LibraryArtifact
   onPush: () => void
   pushing: boolean
   failed: boolean
-  onRemove: () => void
-  onCancelRemove: () => void
-  removing: boolean
-  removeFailed: boolean
 }) {
   const synced = artifact.pushedVersion !== null
   const upToDate = artifact.pushedVersion === artifact.version
@@ -948,18 +1168,24 @@ function PickerCard({
      than only grey out its button, because images are the bulk of a real
      library and a disabled control with no reason reads as a bug. */
   const notPushable = artifact.kind === 'image'
-  // A bare click must not delete a paid-bucket object, so removal is revealed
-  // behind an inline Cancel + danger confirm, mirroring the drive folder delete.
-  const [confirmRemove, setConfirmRemove] = useState(false)
-  // The card outlives its own sync state: it is keyed by slug, so a successful
-  // removal only re-renders it with `synced` false rather than unmounting it,
-  // and the confirm intent would survive into the next push. Dropping the intent
-  // the moment there is nothing to remove is what keeps a later Push from
-  // re-revealing an armed danger strip nobody asked for -- with its own trigger
-  // hidden, since that renders on `!confirmRemove`.
-  useEffect(() => {
-    if (!synced) setConfirmRemove(false)
-  }, [synced])
+  /* NO removal control here, deliberately, and this is the defect the change
+     fixes rather than an omission.
+
+     This card is a LOCAL artifact joined to a ledger keyed `account -> slug`.
+     `ArtifactStore.delete` does not prune that ledger, and a new artifact starts
+     at version 1 -- so pushing A, deleting A locally and creating a B that takes
+     A's slug leaves B's card wearing A's push record. A removal offered here
+     would empty `artifacts/<slug>/`, which is A's copy, under B's name. No
+     predicate available on this card can tell the two apart: `synced` is the
+     inherited record itself, and `pushedVersion === version` is satisfied by a
+     never-pushed B at v1 against A's pushed v1. Naming the folder in the confirm
+     narrows the blast radius but cannot fix it -- the reader is still being asked
+     to vouch for an identity this machine cannot establish.
+
+     Removal therefore belongs to the Library folder behind this dialog, whose
+     rows come from the bucket listing, so removing one empties the object the
+     reader was actually shown. Until #6987 reads the pushed meta.json sidecar,
+     that is the only place the identity holds. */
   return (
     <div className="mb-3 mr-3 overflow-hidden rounded-lg border border-border bg-card" data-testid="library-tile">
       <div className="pointer-events-none">
@@ -982,18 +1208,6 @@ function PickerCard({
         {failed && !notPushable && (
           <p className="mt-2 text-[11px] leading-snug text-danger" data-testid="library-push-error">
             {i18nT('apps.awsControl.console.library_push_failed')}
-          </p>
-        )}
-        {/* Cancel RETIRES the failure (`onCancelRemove` drops the slug), rather
-            than the render merely hiding it while the strip is closed. Hiding
-            alone leaves the slug in the failed set, so the next Remove opens a
-            fresh strip already showing a red "delete failed" for an attempt the
-            reader dismissed and has not retried. Otherwise the slug clears only
-            when a removal is retried, which leaves a reader who backs out with a
-            standing error beside a copy that is still there. */}
-        {removeFailed && (
-          <p className="mt-2 text-[11px] leading-snug text-danger" data-testid="library-remove-error">
-            {i18nT('apps.awsControl.console.delete_failed')}
           </p>
         )}
         {!notPushable && (
@@ -1033,83 +1247,10 @@ function PickerCard({
                       ? i18nT('apps.awsControl.console.library_update')
                       : i18nT('apps.awsControl.console.library_add_one')}
               </Btn>
-              {/* A remove control only makes sense once an artifact has a cloud
-                  copy; an unsynced card has nothing to empty. */}
-              {synced && !confirmRemove && (
-                <Btn onClick={() => setConfirmRemove(true)} data-testid="library-remove">
-                  <Trash2 size={13} />
-                  {i18nT('apps.awsControl.console.library_remove')}
-                </Btn>
-              )}
             </div>
           </div>
         )}
       </div>
-      {synced && confirmRemove && (
-        <div className="flex flex-wrap items-center gap-2 px-3 pb-3 text-[12px]" data-testid="library-remove-confirm">
-          {/* Removal targets the SLUG, not this local artifact: `libraryRemove`
-              empties the `artifacts/<slug>/` cloud prefix, and the ledger that
-              lit this tile's synced flag is keyed by slug alone (see the
-              identity note in LibrarySection). Slugs come from names and are
-              reused -- delete a pushed artifact locally, create another that
-              takes the same slug, and its never-pushed tile inherits the old
-              push record and offers this Remove, which would empty a DIFFERENT
-              artifact's cloud copy. This machine cannot prove the copy is this
-              artifact's without reading the pushed meta.json sidecar, so the
-              confirm names the cloud folder it will actually empty rather than
-              only the local name, turning a silent wrong-target delete into one
-              the reader confirms against its true identity.
-
-              The literal is the BUCKET key prefix (`artifacts/`, the drive's
-              library section — the same prefix the "Where this lives" drawer
-              hands the reader for `aws s3 ls`), not the `library/` API route
-              segment. A path that does not exist in the bucket cannot be
-              cross-checked in the S3 console, which is the only place the
-              wrong-target case is catchable. */}
-          {/* `basis-full` so the prompt takes its own line and the two controls
-              wrap under it. Sharing the line inside a grid-column-width card
-              squeezed the text to a few characters and broke the folder path
-              across lines mid-token, which is unreadable as the identity the
-              reader is supposed to check the delete against. */}
-          <span className="min-w-0 flex-1 basis-full text-text" data-testid="library-remove-confirm-text">
-            {i18nT('apps.awsControl.console.library_remove_confirm', { name: artifact.name })}{' '}
-            {/* `<Trans>` rather than a bare string plus a sibling `<code>`: the folder
-                path is a monospace chip inside the sentence, and splitting the sentence
-                around it would leave the translator a lead-in fragment they cannot
-                reorder around their own word order. One key carries the whole sentence
-                and names the chip with a `<folder>` tag. */}
-            <span className="text-muted">
-              <Trans
-                i18nKey="apps.awsControl.console.library_remove_confirm_slug"
-                values={{ folder: `artifacts/${artifact.slug}/` }}
-                components={{ folder: <code className="text-[11px] text-muted" /> }}
-              />
-            </span>
-          </span>
-          <Btn
-            onClick={() => { setConfirmRemove(false); onCancelRemove() }}
-            disabled={removing}
-            data-testid="library-remove-cancel"
-          >
-            {i18nT('apps.awsControl.console.cancel')}
-          </Btn>
-          {/* The strip stays open while the request runs, because closing it on
-              the click would hide the outcome entirely. On success the card's
-              synced flag flips false via the query invalidation, which unmounts
-              both the strip and its trigger; on failure the strip stays with the
-              button re-enabled and delete_failed rendered above, so a retry or a
-              Cancel are both one click. */}
-          <Btn
-            danger
-            disabled={removing}
-            onClick={onRemove}
-            data-testid="library-remove-action"
-          >
-            <Trash2 size={13} />
-            {i18nT('apps.awsControl.console.library_remove')}
-          </Btn>
-        </div>
-      )}
     </div>
   )
 }
@@ -1530,38 +1671,40 @@ function DriveSectionView({ account, bucket }: { account: string; bucket: string
               >
                 <div className="flex w-full items-start justify-between gap-2">
                   <FileText size={22} className="text-muted" aria-hidden="true" />
-                  <div className="flex items-center gap-1">
-                    <button
-                      type="button"
-                      onClick={() => download(f.key)}
-                      className="cursor-pointer rounded border-none bg-transparent p-1 text-muted transition-colors hover:text-text"
-                      title={i18nT('apps.awsControl.console.download')}
-                      aria-label={i18nT('apps.awsControl.console.download')}
-                      data-testid="drive-grid-download"
-                    >
-                      <Download size={13} />
-                    </button>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <button
-                          type="button"
-                          className="cursor-pointer rounded border-none bg-transparent p-1 text-muted transition-colors hover:text-text"
-                          aria-label={i18nT('apps.awsControl.console.file_actions')}
-                          data-testid="drive-grid-more"
-                        >
-                          <MoreHorizontal size={14} />
-                        </button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        <DropdownMenuItem onSelect={() => setShare({ key: f.key })} data-testid="drive-grid-share">
-                          <Share2 size={13} />{i18nT('apps.awsControl.console.share')}
-                        </DropdownMenuItem>
-                        <DropdownMenuItem onSelect={() => setConfirmDelete(f.key)} data-testid="drive-grid-delete">
-                          <Trash2 size={13} />{i18nT('apps.awsControl.console.delete')}
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
+                  {/* ONE home for per-item actions. Download used to sit outside
+                      the menu as a bare button while Share and Delete were
+                      inside it, so a card offered two different grammars for
+                      "act on this item" and a reader had to learn both. It is
+                      the same inconsistency the Library folder's visible Remove
+                      was rejected for, one component over, so it is fixed in the
+                      same change rather than left to recreate the problem. */}
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <button
+                        type="button"
+                        className="cursor-pointer rounded border-none bg-transparent p-1 text-muted transition-colors hover:text-text"
+                        aria-label={i18nT('apps.awsControl.console.file_actions')}
+                        data-testid="drive-grid-more"
+                      >
+                        <MoreHorizontal size={14} />
+                      </button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      {/* `onSelect` is dispatched synchronously from the item's
+                          own click handler, so the window.open inside
+                          `download` still runs within the user gesture and is
+                          not treated as an unattended popup. */}
+                      <DropdownMenuItem onSelect={() => download(f.key)} data-testid="drive-grid-download">
+                        <Download size={13} />{i18nT('apps.awsControl.console.download')}
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onSelect={() => setShare({ key: f.key })} data-testid="drive-grid-share">
+                        <Share2 size={13} />{i18nT('apps.awsControl.console.share')}
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onSelect={() => setConfirmDelete(f.key)} data-testid="drive-grid-delete">
+                        <Trash2 size={13} />{i18nT('apps.awsControl.console.delete')}
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
                 </div>
                 <span className="w-full truncate text-[13px] font-medium text-text-strong">{f.key.split('/').pop()}</span>
                 <span className="text-[11px] text-muted">
@@ -1741,19 +1884,11 @@ function DriveSectionView({ account, bucket }: { account: string; bucket: string
                         reason the head is shared rather than copied. */}
                     {edges.right && <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 w-px bg-border" />}
                     {edges.right && <div aria-hidden="true" className="pointer-events-none absolute right-full top-0 bottom-0 w-6 bg-gradient-to-l from-card to-transparent" />}
-                      {/* Two controls: the one action a reader takes per
-                          glance, plus one overflow for the rest. */}
+                      {/* ONE overflow, holding every per-item action. Download
+                          used to sit beside it as a bare button while Share and
+                          Delete were inside, which is the same split the grid
+                          card above just lost. */}
                       <div className="flex items-center justify-end gap-1">
-                        <button
-                          type="button"
-                          onClick={() => download(f.key)}
-                          className="p-1 rounded text-muted hover:text-text transition-colors cursor-pointer bg-transparent border-none"
-                          title={i18nT('apps.awsControl.console.download')}
-                          aria-label={i18nT('apps.awsControl.console.download')}
-                          data-testid="drive-download"
-                        >
-                          <Download size={13} />
-                        </button>
                         <DropdownMenu>
                           <DropdownMenuTrigger asChild>
                             <button
@@ -1766,6 +1901,9 @@ function DriveSectionView({ account, bucket }: { account: string; bucket: string
                             </button>
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end">
+                            <DropdownMenuItem onSelect={() => download(f.key)} data-testid="drive-download">
+                              <Download size={13} />{i18nT('apps.awsControl.console.download')}
+                            </DropdownMenuItem>
                             <DropdownMenuItem onSelect={() => setShare({ key: f.key })} data-testid="drive-share">
                               <Share2 size={13} />{i18nT('apps.awsControl.console.share')}
                             </DropdownMenuItem>
