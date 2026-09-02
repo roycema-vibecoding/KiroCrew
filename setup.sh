@@ -43,15 +43,26 @@ _check() {
 
 echo "── Step 1: Python ──"
 _py=""
-for _candidate in python3.12 python3.11 python3.10 python3; do
-    if _check "$_candidate" && "$_candidate" -c "import sys; assert sys.version_info >= (3,10)" 2>/dev/null; then
+for _candidate in python3.12 python3.13 python3; do
+    if _check "$_candidate" && "$_candidate" -c "import sys; assert sys.version_info >= (3,12)" 2>/dev/null; then
         _py="$_candidate"
         break
     fi
 done
+if [ -z "$_py" ] && [ -f "$_kirocrew_dir/ensure-python.sh" ]; then
+    # Runs from a clone, so the repo's own bootstrap is available: provision
+    # 3.12 rather than stopping on a distro whose archive cannot supply it.
+    echo "  → No system Python 3.12+; provisioning one via ensure-python.sh…"
+    bash "$_kirocrew_dir/ensure-python.sh" >/dev/null 2>&1 || true
+    _recorded="$(cat "${KIROCREW_HOME:-$HOME/.kiro/crew}/python-bin" 2>/dev/null || true)"
+    if [ -n "$_recorded" ] && [ -x "$_recorded" ] \
+        && "$_recorded" -c "import sys; assert sys.version_info >= (3,12)" 2>/dev/null; then
+        _py="$_recorded"
+    fi
+fi
 if [ -z "$_py" ]; then
-    echo "  ❌ Python 3.10+ required but not found."
-    echo "     Install Python 3.10+ (https://www.python.org/downloads/) and re-run."
+    echo "  ❌ Python 3.12+ required and could not be provisioned."
+    echo "     Install Python 3.12+ (https://www.python.org/downloads/) and re-run."
     cd - > /dev/null 2>&1
     return 1 2>/dev/null || exit 1
 fi
@@ -181,8 +192,16 @@ fi
 
 # Backend: venv + pip install -e .
 _venv="$_kirocrew_dir/.venv"
-if [ ! -d "$_venv" ] || [ ! -x "$_venv/bin/python" ]; then
-    echo "→ Creating virtual environment..."
+# Same requires-python reuse rule as install.sh: a pre-3.12 venv cannot host the
+# package, so rebuild rather than pip-install into it and hit a hard refusal.
+if [ ! -d "$_venv" ] || [ ! -x "$_venv/bin/python" ] \
+    || ! "$_venv/bin/python" -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
+    if [ -d "$_venv" ]; then
+        echo "→ Recreating virtual environment (existing interpreter < 3.12)..."
+        rm -rf "$_venv"
+    else
+        echo "→ Creating virtual environment..."
+    fi
     "$_py" -m venv "$_venv" || {
         echo "  ❌ Failed to create venv"
         cd - > /dev/null 2>&1

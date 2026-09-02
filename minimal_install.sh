@@ -11,7 +11,7 @@
 #   cd kirocrew
 #   bash minimal_install.sh
 #
-# Prerequisites: Python 3.10+, Node.js 22+ (24 LTS recommended), npm, git
+# Prerequisites: Python 3.12+, Node.js 22+ (24 LTS recommended), npm, git
 # Optional:
 #   --voice    also install voice extras (pip install -e .[voice])
 #   ollama     for local vector memory (see step "Embeddings" below)
@@ -45,12 +45,12 @@ die() { echo "ERROR: $1" >&2; exit 1; }
 has git || die "git not found"
 
 _py=""
-for c in python3.12 python3.11 python3.10 python3; do
-    if has "$c" && "$c" -c "import sys; assert sys.version_info >= (3,10)" 2>/dev/null; then
+for c in python3.12 python3.13 python3; do
+    if has "$c" && "$c" -c "import sys; assert sys.version_info >= (3,12)" 2>/dev/null; then
         _py="$c"; break
     fi
 done
-[ -n "$_py" ] || die "Python 3.10+ not found. Install Python 3.10 or newer and re-run."
+[ -n "$_py" ] || die "Python 3.12+ not found. Install Python 3.12 or newer and re-run."
 
 has node || die "Node.js not found. Install Node.js 22+ (24 LTS recommended, https://nodejs.org) and re-run."
 has npm  || die "npm not found. Install Node.js 22+ (24 LTS recommended, https://nodejs.org) and re-run."
