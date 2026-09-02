@@ -880,6 +880,32 @@ is free, since git refuses an ambiguous abbreviation itself and the command neve
 runs; a fully-spelled unrelated flag such as `--atomic` is unaffected, being a
 prefix of nothing dangerous.
 
+**Option arity is modelled, and a mis-parse can only over-protect.** Only `--repo`
+had its separated value consumed, so every other value-taking push option
+(`-o`/`--push-option`, `--receive-pack`, `--exec`) leaked its value into the
+positional list, where it was read as a remote or refspec. The consequence was not
+a misclassification but an ERASURE: for `--repo=origin --push-option ci.skip` the
+leaked `ci.skip` became the sole "refspec", it normalizes to a non-protected name,
+and the tag set came back empty — which is an ALLOW, since the tag set drives the
+protected-branch decision. The scan now carries an explicit arity table
+(`_PUSH_VALUE_OPTS`, resolved through `_push_option_matches` so abbreviations keep
+working) whose separated values are consumed, and a no-value table
+(`_PUSH_NO_VALUE_OPTS` plus the structural `--no-*` rule and the short-option
+bundles) vouching that a neighbour token is positional. Anything else — a future
+git option, an unmodelled arity such as `--recurse-submodules`'s — hits the
+**fail-protective fallback**: the positional split is not trusted, the bare tag is
+emitted (the current branch may be protected; suppressed only when an all-branches
+flag already covers a superset), and EVERY positional is scanned as a refspec
+candidate so an actual protected name still reports its precise catalog row. A
+token with an attached `=` value never disturbs the split, whatever the option, so
+it is skipped as before; a bare `--` ends option parsing exactly as git reads it.
+The invariant this buys: an unrecognised option can change the answer only toward
+MORE protection, so the erasure class cannot silently reopen when git grows a new
+value-taking option. (Note the earlier retraction of a 35-entry option table on
+the dangerous-PREFIX axis is not precedent against these tables: prefix matching
+is a set intersection where extra names are inert, while arity decides which
+tokens are refspecs at all, so a table here does change outcomes.)
+
 **Opt-out state — keystone `denied_commands.json`.** The opt-out state is a
 security ceiling, so it lives in its OWN keystone file
 `~/.kiro/crew/denied_commands.json` (respecting `KIROCREW_HOME`) — NOT in the

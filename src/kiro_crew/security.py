@@ -5426,6 +5426,59 @@ _PUSH_ALL_BRANCHES_OPTS = frozenset({"mirror", "all", "branches"})
 #: single-arg rule off published to ``main``.
 _PUSH_REPO_OPTS = frozenset({"repo"})
 
+#: The ARITY table (#7796): push options that take a REQUIRED value git also
+#: accepts as a SEPARATED token (``--push-option ci.skip``). The token scan
+#: must consume that value or it leaks into the positional list, where it is
+#: read as a remote/refspec — and because an option value like ``ci.skip``
+#: normalizes to a non-protected name, the tag set for an otherwise-bare
+#: publish came back EMPTY. An empty tag set IS the allow decision, so one
+#: extra flag switched the protected-branch floor off. Same shape as
+#: ``_PUSH_REPO_OPTS`` (which stays separate because its value being the
+#: REMOTE also shifts the positional split), resolved through
+#: ``_push_option_matches`` so abbreviations keep working (finding 2).
+#: Attached forms (``--push-option=x``) bind the value inside the token and
+#: never disturb the split, so they need no entry here.
+_PUSH_VALUE_OPTS = frozenset({"push-option", "receive-pack", "exec"}) | _PUSH_REPO_OPTS
+
+#: Long push options that never consume the NEXT token: booleans, plus the
+#: optional-value options (``--signed``, ``--force-with-lease``) whose value
+#: git binds in ATTACHED form only. ``--no-*`` negations are recognised
+#: structurally (git's negation never takes a separate value), so they are not
+#: enumerated. ``recurse-submodules`` is deliberately ABSENT: listing an
+#: option here vouches that its separated neighbour is a positional, and being
+#: wrong about that is exactly the #7796 erasure — so an option whose arity is
+#: not modelled with confidence falls to the protective fallback instead.
+_PUSH_NO_VALUE_OPTS = frozenset(
+    {
+        "atomic",
+        "delete",
+        "dry-run",
+        "follow-tags",
+        "force",
+        "force-if-includes",
+        "force-with-lease",
+        "ipv4",
+        "ipv6",
+        "porcelain",
+        "progress",
+        "prune",
+        "quiet",
+        "set-upstream",
+        "signed",
+        "tags",
+        "thin",
+        "verbose",
+        "verify",
+    }
+)
+
+#: Short-option arity, resolved the way git resolves a bundle: booleans may
+#: stack (``-fq``), and the first value-taking short consumes the REST of the
+#: token as its attached value (``-oci.skip``) or, when the rest is empty, the
+#: NEXT token (``-o ci.skip`` — or ``-fo ci.skip``, which is ``-f -o ci.skip``).
+_PUSH_VALUE_SHORTS = frozenset({"o"})
+_PUSH_NO_VALUE_SHORTS = frozenset({"f", "n", "q", "v", "u", "d", "4", "6"})
+
 
 def _push_option_matches(token: str, names: "frozenset[str]") -> bool:
     """True when ``token`` is ``--`` plus a PREFIX of any option in ``names``.
@@ -5570,11 +5623,17 @@ def _push_segment_targets_protected(arg_tokens: list[str]) -> frozenset[str]:
     if any(_push_option_matches(tok, _PUSH_ALL_BRANCHES_OPTS) for tok in tokens):
         tags.add("git-publish-push-mirror-all")
     # Skip flags (tokens starting with -); non_flags[0] is the remote and
-    # non_flags[1:] are the refspecs/branches. A flag that CARRIES the repository
-    # (``--repo=x`` / ``--repo x``, or any abbreviation of it) means the remote is
-    # NOT positional, so every remaining token is a refspec. Consuming the
-    # separated form's value keeps it from being read as the remote.
+    # non_flags[1:] are the refspecs/branches. Option ARITY is modelled
+    # explicitly (#7796): a flag that CARRIES the repository (``--repo=x`` /
+    # ``--repo x``) means the remote is NOT positional, a value-taking option's
+    # SEPARATED value is consumed so it is never read as a remote/refspec, and
+    # any option the scan does not recognise poisons the positional split
+    # entirely (see the fail-protective fallback below) — because trusting a
+    # split that may contain a leaked option value is how the floor tag was
+    # erased. A bare ``--`` ends option parsing, exactly as git reads it.
     repo_in_flag = False
+    unrecognised_option = False
+    positional_only = False
     non_flags: list[str] = []
     skip_next = False
     for tok in tokens:
@@ -5583,15 +5642,59 @@ def _push_segment_targets_protected(arg_tokens: list[str]) -> frozenset[str]:
             continue
         if not tok:
             continue
-        if tok.startswith("-"):
-            if _push_option_matches(tok, _PUSH_REPO_OPTS):
-                repo_in_flag = True
-                skip_next = "=" not in tok
+        if positional_only or not tok.startswith("-"):
+            non_flags.append(tok)
             continue
-        non_flags.append(tok)
-    # With the repository supplied by a flag there is no positional remote to
-    # drop, so the refspecs start at index 0.
-    refspecs = non_flags if repo_in_flag else non_flags[1:]
+        if tok == "--":
+            positional_only = True
+            continue
+        if _push_option_matches(tok, _PUSH_REPO_OPTS):
+            repo_in_flag = True
+            skip_next = "=" not in tok
+            continue
+        if "=" in tok:
+            # An attached value binds inside the token — whatever the option
+            # is, it cannot disturb the positional split.
+            continue
+        if tok.startswith("--"):
+            if _push_option_matches(tok, _PUSH_VALUE_OPTS):
+                skip_next = True
+            elif not (
+                tok.startswith("--no-")
+                or _push_option_matches(tok, _PUSH_NO_VALUE_OPTS)
+                or _push_option_matches(tok, _PUSH_ALL_BRANCHES_OPTS)
+            ):
+                unrecognised_option = True
+            continue
+        # Short-option token: resolve the bundle char by char like git does.
+        for i, ch in enumerate(tok[1:]):
+            if ch in _PUSH_VALUE_SHORTS:
+                # Rest of the token is the attached value; consume the NEXT
+                # token only when there is no rest.
+                skip_next = i == len(tok) - 2
+                break
+            if ch not in _PUSH_NO_VALUE_SHORTS:
+                unrecognised_option = True
+                break
+    if unrecognised_option:
+        # Fail-protective invariant (#7796, shape C): an option this scan does
+        # not model might take a separated value, so the positional split
+        # cannot be trusted — the "remote" it would drop may really be a
+        # leaked option value. Read the segment protectively instead: the
+        # current branch might be protected (the bare tag — unless an
+        # all-branches flag already names the target set exhaustively, the
+        # finding-3 suppression, in which case mirror-all covers a superset of
+        # bare), and EVERY positional is scanned as a refspec candidate so an
+        # actual protected name still reports its own precise catalog row. A
+        # mis-parse can therefore only ever OVER-protect: a future value-taking
+        # push option cannot silently reopen the erasure class.
+        if "git-publish-push-mirror-all" not in tags:
+            tags.add("git-publish-push-bare")
+        refspecs = non_flags
+    else:
+        # With the repository supplied by a flag there is no positional remote
+        # to drop, so the refspecs start at index 0.
+        refspecs = non_flags if repo_in_flag else non_flags[1:]
     if not refspecs and "git-publish-push-mirror-all" not in tags:
         # Bare ``push`` or ``push <remote>`` with no explicit branch — the
         # current branch might be protected.  The two spellings are separate
